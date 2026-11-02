@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+outputs/
+.browser-profile/
+*.checkpoint.json
+build/
+dist/
+*.spec
