@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 
 from .actions import workspace_identity
+from .organizations import OrganizationCache, load_settings, save_python, save_settings
 from .site import WindowsReader
 from .reviewers import load_names, parse_names, save_names
 from .rules import month_bounds, normalized
@@ -24,7 +25,8 @@ from .workbook import DEFAULTS, load_config, report
 CARDS = (("Qualified", "Qualified"), ("Yes", "Yes"), ("No", "No"),
          ("Unresolved", "Unresolved Actions"), ("Excluded", "Excluded"))
 DOCUMENT_COLUMNS = (("result", "Flawless", 80), ("document", "Document ID", 95), ("title", "CCB Title", 300),
-                    ("manager", "Author Manager", 170), ("phase", "Phase", 100), ("submitted", "Submitted", 95),
+                    ("manager", "Author Manager", 170), ("organization", "Organization", 240),
+                    ("phase", "Phase", 100), ("submitted", "Submitted", 95),
                     ("url", "Document WS URL", 420), ("notes", "Notes", 200))
 RESULT_FILTERS = ("All", "Yes", "No", "Unresolved")
 ROW_TAGS = {"Yes": "yes", "No": "no"}
@@ -47,13 +49,13 @@ def short_note(reasons):
     return first if len(first) <= 40 else first[:39] + "…"
 
 
-def document_row(result, document, title, manager, phase, submitted, url, matches, reasons):
+def document_row(result, document, title, manager, phase, submitted, url, matches, reasons, organization="Unresolved"):
     if isinstance(submitted, (date, datetime)):
         submitted = submitted.strftime("%Y-%m-%d")
     result = result or ""
     notes = f"Assigned by: {matches}" if result == "No" and matches else short_note(reasons)
     return tuple("" if v is None else " ".join(str(v).split()) for v in (
-        result, document, title, manager, phase, submitted, url, notes))
+        result, document, title, manager, organization, phase, submitted, url, notes))
 
 
 def read_results(path):
@@ -72,7 +74,7 @@ def read_results(path):
             link = cells[index["Document WS URL"]]
             url = link.hyperlink.target if link.hyperlink and link.hyperlink.target else (checked[2] or "")
             documents.append(document_row(checked[5], checked[1], get("CCB Title"), get("Author Manager"), get("Phase"),
-                                          get("Document Submitted"), url, checked[6], checked[7]))
+                                          get("Document Submitted"), url, checked[6], checked[7], get("Organization")))
         return status, groups, documents
     finally:
         book.close()
@@ -88,6 +90,15 @@ class Dashboard:
         self.documents_data = []
         self.report_bytes = None
         self.run_month = ""
+        self.organization_refresh = False
+        self.organization_codes = []
+        self.organization_error = ""
+        try:
+            self.organization_codes = load_settings()["organization_codes"]
+            OrganizationCache()
+        except (OSError, ValueError) as exc:
+            self.organization_error = str(exc)
+            messagebox.showerror("Organization settings/cache error", str(exc), parent=root)
         root.title("xCCB Flawless Submission Dashboard")
         self.scale = max(1.0, root.winfo_fpixels("1i") / 96)
         root.geometry(f"{self.px(1180)}x{self.px(740)}")
@@ -219,6 +230,11 @@ class Dashboard:
         self.reviewer_status = tk.StringVar()
         ttk.Label(panel, textvariable=self.reviewer_status, style="Muted.TLabel").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.organization_button = ttk.Button(panel, text="Organizations…", command=self.choose_organizations)
+        self.organization_button.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self.organization_label = tk.StringVar(value=self.organization_selection_label())
+        ttk.Label(panel, textvariable=self.organization_label, wraplength=self.px(210)).grid(
+            row=6, column=0, sticky="w", pady=(4, 0))
         if self.reviewer_path.exists():
             self.reload_reviewers()
         else:
@@ -277,8 +293,8 @@ class Dashboard:
         self.tabs.add(tab, text="By Author Manager")
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        self.table = ttk.Treeview(tab, columns=("manager", "qualified", "yes", "no", "unresolved"), show="headings")
-        for column, title, width in (("manager", "Author Manager", 330), ("qualified", "Qualified", 100),
+        self.table = ttk.Treeview(tab, columns=("manager", "organization", "qualified", "yes", "no", "unresolved"), show="headings")
+        for column, title, width in (("manager", "Author Manager", 250), ("organization", "Organization", 260), ("qualified", "Qualified", 100),
                                      ("yes", "Yes", 70), ("no", "No", 70), ("unresolved", "Unresolved", 110)):
             self.table.heading(column, text=title)
             self.table.column(column, width=self.px(width), anchor="w" if column == "manager" else "center")
@@ -286,6 +302,9 @@ class Dashboard:
         scroll = ttk.Scrollbar(tab, orient="vertical", command=self.table.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(tab, orient="horizontal", command=self.table.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.table.configure(xscrollcommand=horizontal.set)
         self.table.bind("<Double-1>", lambda _event: self.show_manager())
 
     @staticmethod
@@ -504,6 +523,111 @@ class Dashboard:
         self.reviewer_status.set(f"Saved {len(names)} name{'s' if len(names) != 1 else ''}")
         return names
 
+    def organization_selection_label(self):
+        return "Report organizations: " + (", ".join(self.organization_codes) or "All")
+
+    def choose_organizations(self):
+        if self.running:
+            return
+        try:
+            cache = OrganizationCache()
+            settings = load_settings()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Organization error", str(exc), parent=self.root)
+            return
+        popup = tk.Toplevel(self.root)
+        popup.title("Report organizations")
+        popup.transient(self.root)
+        popup.geometry(f"{self.px(640)}x{self.px(480)}")
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(0, weight=1)
+        organizations = {entry.organization_code: entry.organization for entry in cache.entries.values()}
+        organizations.update({code: organizations.get(code, "Selected code") for code in self.organization_codes})
+        picker = tk.Listbox(popup, selectmode="multiple", exportselection=False)
+        picker.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        codes = sorted(organizations)
+        for index, code in enumerate(codes):
+            picker.insert("end", f"{code} — {organizations[code]}")
+            if code in self.organization_codes:
+                picker.selection_set(index)
+        scroll = ttk.Scrollbar(popup, command=picker.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        picker.configure(yscrollcommand=scroll.set)
+        ttk.Label(popup, text="Additional exact codes (comma-separated)").grid(row=1, column=0, sticky="w", padx=8)
+        additional = ttk.Entry(popup)
+        additional.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        python = tk.StringVar(value=settings.get("organization_python", ""))
+        row = ttk.Frame(popup)
+        row.grid(row=3, column=0, sticky="ew", padx=8)
+        row.columnconfigure(0, weight=1)
+        ttk.Entry(row, textvariable=python).grid(row=0, column=0, sticky="ew")
+        def browse_python():
+            chosen = filedialog.askopenfilename(parent=popup, title="Python with DataSyncX", filetypes=[("Python", "python.exe")])
+            if chosen:
+                python.set(chosen)
+        ttk.Button(row, text="DataSyncX Python…", command=browse_python).grid(row=0, column=1, padx=(6, 0))
+        refresh = tk.BooleanVar(value=self.organization_refresh)
+        ttk.Checkbutton(popup, text="Refresh cached organizations on next report", variable=refresh).grid(row=4, column=0, sticky="w", padx=8, pady=8)
+        buttons = ttk.Frame(popup)
+        buttons.grid(row=5, column=0, sticky="ew", padx=8, pady=8)
+        ttk.Button(buttons, text="All organizations", command=lambda: (picker.selection_clear(0, "end"), additional.delete(0, "end"))).pack(side="left")
+        def apply():
+            selected = sorted(set([codes[index] for index in picker.curselection()] + [code.strip() for code in additional.get().split(",") if code.strip()]))
+            try:
+                save_settings(selected)
+                save_python(python.get().strip())
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Cannot save organizations", str(exc), parent=popup)
+                return
+            self.organization_codes = selected
+            self.organization_refresh = refresh.get()
+            self.organization_error = ""
+            self.organization_label.set(self.organization_selection_label())
+            self.report_bytes = None
+            self.export_button.configure(state="disabled")
+            self.status.set("Organization settings saved; refresh the report.")
+            popup.destroy()
+        ttk.Button(buttons, text="Apply", command=apply).pack(side="right")
+        popup.grab_set()
+
+    def confirm_identity(self, name, candidates):
+        answer = Queue()
+        self.events.put(("identity", (name, candidates, answer)))
+        while not self.cancel.is_set():
+            try:
+                return answer.get(timeout=0.1)
+            except Empty:
+                pass
+        return None
+
+    def identity_dialog(self, name, candidates, answer):
+        popup = tk.Toplevel(self.root)
+        popup.title(f"Confirm Author Manager: {name}")
+        popup.transient(self.root)
+        popup.geometry(f"{self.px(820)}x{self.px(320)}")
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(0, weight=1)
+        choices = tk.Listbox(popup, exportselection=False)
+        choices.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        for candidate in candidates:
+            choices.insert("end", " | ".join(str(candidate.get(field, "")) for field in
+                           ("wwid", "name", "site", "organization_code", "organization", "cost_center")))
+        horizontal = ttk.Scrollbar(popup, orient="horizontal", command=choices.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        choices.configure(xscrollcommand=horizontal.set)
+        def finish(confirmed=False):
+            selected = choices.curselection()
+            if confirmed and not selected:
+                return
+            answer.put(str(candidates[selected[0]]["wwid"]) if confirmed else None)
+            popup.destroy()
+        buttons = ttk.Frame(popup)
+        buttons.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
+        ttk.Button(buttons, text="Leave unresolved", command=finish).pack(side="left")
+        ttk.Button(buttons, text="Confirm identity", command=lambda: finish(True)).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", finish)
+        popup.grab_set()
+
     def reload_reviewers(self):
         try:
             names = load_names(self.reviewer_path)
@@ -516,6 +640,9 @@ class Dashboard:
 
     def start(self):
         if self.running:
+            return
+        if self.organization_error:
+            messagebox.showerror("Organization error", self.organization_error, parent=self.root)
             return
         source, evidence = self.source.get().strip(), str(self.evidence)
         if not source or not Path(source).is_file():
@@ -542,6 +669,7 @@ class Dashboard:
         self.stop_button.configure(state="normal")
         self.export_button.configure(state="disabled")
         self.month_picker.configure(state="disabled")
+        self.organization_button.configure(state="disabled")
         self.table.delete(*self.table.get_children())
         self.manager_items.clear()
         self.documents_data = []
@@ -568,7 +696,9 @@ class Dashboard:
                 counts = report(source, output, config, evidence, reader=WindowsReader(cancel=cancel) if live else None,
                                 on_progress=lambda counts, group, document: self.events.put(
                                     ("progress", (counts, group, document))),
-                                reporting_month=selected_month)
+                                reporting_month=selected_month, organization_codes=list(self.organization_codes),
+                                refresh_organizations=self.organization_refresh, confirm_identity=self.confirm_identity,
+                                on_organization_progress=lambda text: self.events.put(("organization_progress", text)), cancel=cancel)
                 status, groups, documents = read_results(output)
                 data = output.read_bytes()
             self.events.put(("complete", (counts, status, groups, documents, data)))
@@ -595,6 +725,12 @@ class Dashboard:
                 event, result = self.events.get_nowait()
             except Empty:
                 break
+            if event == "organization_progress":
+                self.status.set(result)
+                continue
+            if event == "identity":
+                self.identity_dialog(*result)
+                continue
             if event == "progress":
                 counts, group, document = result
                 self.display_results(counts, [group] if group is not None else [])
@@ -609,9 +745,11 @@ class Dashboard:
             self.run_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
             self.month_picker.configure(state="normal")
+            self.organization_button.configure(state="normal")
             self.progress.stop()
             self.progress.grid_remove()
             if event == "complete":
+                self.organization_refresh = False
                 counts, status, groups, documents, data = result
                 self.status.set("DRAFT - unresolved results" if status.startswith("DRAFT") else status)
                 if not counts.get("Qualified", 0):

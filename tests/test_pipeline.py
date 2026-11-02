@@ -17,6 +17,12 @@ FRAME = "https://xccb2.intel.com/Documents/DocumentComponents.aspx?Component=Act
 HTML = '<body onclick="secret"><form><input name="__VIEWSTATE" value="secret"><!--secret--><div>Actions</div><table class="action-panel"><tr><td><a href="/Actions/CompleteDocumentAction.aspx?ActionID=1&amp;DocumentID=123">Action</a><span>Assigned By: <b>Person, One</b></span></td></tr></table></form><script>secret</script></body>'
 
 
+@pytest.fixture(autouse=True)
+def offline_organizations(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "private_user"))
+    monkeypatch.setattr("xccb_report.workbook.query_directory", lambda *args: [])
+
+
 def config():
     return deepcopy(DEFAULTS) | {"assigned_by_names": ["Person, One"], "reviewer_names": ["Reviewer, One"], "action_scope": "document"}
 
@@ -50,15 +56,15 @@ def test_report_preserves_links_and_caches_document(tmp_path, monkeypatch):
     assert counts["No"] == 2
     book = load_workbook(output)
     tab = book["Flawless submissions"]
-    assert tab.max_column == 44 and tab.max_row == 3
+    assert tab.max_column == 45 and tab.max_row == 3
     assert tab["A1"].fill.fgColor.rgb == "00123456"
     assert tab.column_dimensions["A"].fill.fgColor.rgb == "00ABCDEF"
-    assert tab["G2"].hyperlink.target == URL
-    assert tab["G2"].hyperlink.ref == "G2"
-    assert tab["AR2"].value == "No"
-    assert tab["I2"].data_type == "s" and tab["I2"].value.startswith("=HYPERLINK")
+    assert tab["H2"].hyperlink.target == URL
+    assert tab["H2"].hyperlink.ref == "H2"
+    assert tab["AS2"].value == "No"
+    assert tab["J2"].data_type == "s" and tab["J2"].value.startswith("=HYPERLINK")
     assert book["Audit"].max_row == 3
-    assert tab.auto_filter.ref == "A1:AR3"
+    assert tab.auto_filter.ref == "A1:AS3"
     assert load_workbook(original).active.max_row == 5
     with pytest.raises(ValueError, match="never overwritten"):
         report(original, output, config(), tmp_path)
@@ -77,7 +83,7 @@ def test_empty_reviewer_list_includes_only_blank_reviewers(tmp_path):
     book = load_workbook(output)
     assert book["Flawless submissions"].max_row == 2
     assert book["Summary"]["B2"].value.startswith("DRAFT")
-    assert list(book["By Author Manager"].values)[1] == ("Manager, One", 1, 0, 0, 1)
+    assert list(book["By Author Manager"].values)[1] == ("Manager, One", "Unresolved", 1, 0, 0, 1)
 
 
 def test_reporting_month_does_not_change_evidence_time(tmp_path, monkeypatch):
@@ -216,7 +222,7 @@ def test_report_accepts_other_phases_but_excludes_wla(tmp_path):
     counts = report(original, output, config(), tmp_path, datetime(2026, 10, 30, tzinfo=timezone.utc))
     assert counts["Qualified"] == 1 and counts["Excluded"] == 1
     book = load_workbook(output)
-    assert book["Flawless submissions"]["E2"].value == "LSI Modification"
+    assert book["Flawless submissions"]["F2"].value == "LSI Modification"
     assert book["Flawless submissions"].max_row == 2
     summary = dict(book["Summary"].values)
     assert summary["Phase rule"] == "All phases except values containing WLA (case-insensitive)"
@@ -241,8 +247,8 @@ def test_report_groups_managers_without_excluding_missing_or_unmapped_names(tmp_
     book = load_workbook(output)
     assert [row[0] for row in book["Flawless submissions"].iter_rows(min_row=2, values_only=True)] == ["A Manager", "Z Manager", None]
     groups = list(book["By Author Manager"].iter_rows(min_row=2, values_only=True))
-    assert groups == [("A Manager", 1, 0, 0, 1), ("Z Manager", 1, 0, 0, 1), ("(Not specified)", 1, 0, 0, 1)]
-    assert sum(row[1] for row in groups) == counts["Qualified"]
+    assert groups == [("A Manager", "Unresolved", 1, 0, 0, 1), ("Z Manager", "Unresolved", 1, 0, 0, 1), ("(Not specified)", "Unresolved", 1, 0, 0, 1)]
+    assert sum(row[2] for row in groups) == counts["Qualified"]
     book.close()
 
 
@@ -272,7 +278,7 @@ def test_live_failure_does_not_reuse_previous_success(tmp_path, monkeypatch):
     monkeypatch.setattr("xccb_report.workbook.load_evidence", lambda *_: pytest.fail("Stale success reused"))
     counts = report(original, output, config(), tmp_path, datetime(2026, 10, 30, tzinfo=timezone.utc), reader=object())
     assert counts["Unresolved Actions"] == 2
-    assert load_workbook(output)["Flawless submissions"]["AR2"].value is None
+    assert load_workbook(output)["Flawless submissions"]["AS2"].value is None
 
 
 def test_report_streams_completed_documents_concurrently_in_source_order(tmp_path, monkeypatch):
@@ -311,8 +317,8 @@ def test_report_streams_completed_documents_concurrently_in_source_order(tmp_pat
     counts = report(original, output, config(), tmp_path, datetime(2026, 10, 30, tzinfo=timezone.utc),
                     reader=object(), on_progress=progress)
     assert sorted(captures) == sorted([URL, fast_url])
-    assert updates[0] == ({"No": 1, "Qualified": 1}, ("Z Fast Manager", 1, 0, 1, 0))
-    assert updates[1][1] == ("Z Fast Manager", 2, 0, 2, 0)
+    assert updates[0] == ({"No": 1, "Qualified": 1}, ("Z Fast Manager", "Unresolved", 1, 0, 1, 0))
+    assert updates[1][1] == ("Z Fast Manager", "Unresolved", 2, 0, 2, 0)
     assert updates[-1][0] == counts
     assert counts["Qualified"] == counts["No"] == 3
     book = load_workbook(output)
@@ -321,7 +327,7 @@ def test_report_streams_completed_documents_concurrently_in_source_order(tmp_pat
             "A Slow Manager", "Z Fast Manager", "Z Fast Manager"]
         assert [row[0] for row in book["Audit"].iter_rows(min_row=2, values_only=True)] == [4, 5, 6]
         assert list(book["By Author Manager"].values)[1:] == [
-            ("A Slow Manager", 1, 0, 1, 0), ("Z Fast Manager", 2, 0, 2, 0)]
+            ("A Slow Manager", "Unresolved", 1, 0, 1, 0), ("Z Fast Manager", "Unresolved", 2, 0, 2, 0)]
     finally:
         book.close()
 
@@ -375,7 +381,7 @@ def test_dashboard_displays_progress_before_completion(tmp_path, monkeypatch):
     release = Event()
 
     def streaming_report(*args, on_progress, **kwargs):
-        on_progress({"Qualified": 1, "No": 1}, ("Manager, One", 1, 0, 1, 0), {
+        on_progress({"Qualified": 1, "No": 1}, ("Manager, One", "Unresolved", 1, 0, 1, 0), {
             "result": "No", "document": "999", "title": "Streamed", "manager": "Manager, One", "phase": "P",
             "submitted": None, "url": URL, "matches": "Person, One", "reasons": ""})
         assert release.wait(timeout=10), "Dashboard did not show progress before completion"
@@ -400,7 +406,7 @@ def test_dashboard_displays_progress_before_completion(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert dashboard.running and not errors
         assert "Qualified: 1" in dashboard.metrics.get()
-        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "1", "0", "1", "0")
+        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "Unresolved", "1", "0", "1", "0")
         streamed = dashboard.documents.item(dashboard.documents.get_children()[0], "values")
         assert streamed[0] == "No" and streamed[1] == "999" and streamed[-1] == "Assigned by: Person, One"
         dashboard.stop()
@@ -414,7 +420,7 @@ def test_dashboard_displays_progress_before_completion(tmp_path, monkeypatch):
         assert not dashboard.running and not errors
         assert dashboard.run_indicator.cget("text") == "Stopped"
         assert len(dashboard.table.get_children()) == 1
-        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "2", "0", "0", "2")
+        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "Unresolved", "2", "0", "0", "2")
     finally:
         release.set()
         root.destroy()
@@ -460,7 +466,7 @@ def test_dashboard_generates_grouped_report_in_background(tmp_path, monkeypatch)
         assert "Qualified: 2" in dashboard.metrics.get()
         assert dashboard.status.get().startswith("DRAFT")
         assert len(dashboard.table.get_children()) == 1
-        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "2", "0", "0", "2")
+        assert dashboard.table.item(dashboard.table.get_children()[0], "values") == ("Manager, One", "Unresolved", "2", "0", "0", "2")
         assert (tmp_path / "reviewer_names.txt").read_text(encoding="utf-8") == "Reviewer, One\n"
         rows = [dashboard.documents.item(item, "values") for item in dashboard.documents.get_children()]
         assert len(rows) == 2 and all(row[0] == "Unresolved" and row[1] == "123" and row[-2] == URL and row[-1] for row in rows)
@@ -551,7 +557,7 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
         assert not dashboard.column_filters
         assert visible() == ["0", "1", "2", "3"]
         dashboard.column_filters[3] = {"Manager A"}
-        dashboard.column_filters[4] = {"P"}
+        dashboard.column_filters[5] = {"P"}
         dashboard.render_documents()
         assert visible() == ["0"]
         dashboard.result_filter.set("No")

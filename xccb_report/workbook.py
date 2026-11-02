@@ -10,11 +10,12 @@ from tempfile import NamedTemporaryFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from .actions import workspace_identity
 from .evidence import load_evidence
-from .rules import PHASE_RULE, REVIEWER_RULE, classify, eligibility, month_bounds, normalized
+from .organizations import OrganizationCache, load_settings, query_directory
+from .rules import Eligibility, PHASE_RULE, REVIEWER_RULE, classify, eligibility, month_bounds, normalized
 from .reviewers import load_names
 
 REQUIRED = {"Author Manager", "Reviewing Forum", "Reviewer(s)", "Is FYI?", "Phase", "Document Submitted", "Document WS URL"}
@@ -65,14 +66,28 @@ def copy_style(source, target):
     target.number_format = source.number_format
 
 
-def report(source, output, config, evidence_dir, now=None, reader=None, *, on_progress=None, reporting_month=None):
+def report(source, output, config, evidence_dir, now=None, reader=None, *, on_progress=None, reporting_month=None,
+           organization_cache=None, organization_query=None, organization_codes=None, refresh_organizations=False,
+           confirm_identity=None, on_organization_progress=None, cancel=None):
     source, output = Path(source).resolve(), Path(output).resolve()
     if source == output or output.exists():
         raise ValueError("Choose a new output file; existing workbooks are never overwritten")
     fixed_time = now is not None
     now = now or datetime.now(timezone.utc)
     start, end = month_bounds(now, config["timezone"], reporting_month)
+    settings = load_settings()
+    cache = organization_cache if organization_cache is not None else OrganizationCache()
+    codes = settings["organization_codes"] if organization_codes is None else organization_codes
+    query = organization_query or (lambda name, wwid: query_directory(name, wwid, settings.get("organization_python")))
     book, sheet, headers = read_source(source)
+    manager_index = headers.index("Author Manager")
+    try:
+        organizations, organization_issues = cache.resolve(
+            [row[manager_index] for row in sheet.iter_rows(min_row=4, values_only=True)], query,
+            refresh=refresh_organizations, confirm=confirm_identity, progress=on_organization_progress, cancel=cancel)
+    except Exception:
+        book.close()
+        raise
     out = Workbook()
     out.epoch = book.epoch
     result_sheet = out.active
@@ -80,7 +95,7 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
     summary = out.create_sheet("Summary")
     audit = out.create_sheet("Audit")
     managers = out.create_sheet("By Author Manager")
-    managers.append(["Author Manager", "Qualified rows", "Yes", "No", "Unresolved Actions"])
+    managers.append(["Author Manager", "Organization", "Qualified rows", "Yes", "No", "Unresolved Actions"])
     for key, dimension in sheet.column_dimensions.items():
         target_dimension = result_sheet.column_dimensions[key]
         for attribute in ("width", "hidden", "bestFit", "min", "max", "outlineLevel", "collapsed"):
@@ -95,7 +110,8 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
     result_sheet.column_dimensions["AR"].width = 24
     result_sheet.row_dimensions[1].height = 75
     result_sheet.freeze_panes = "A2"
-    audit.append(["Source row", "Document ID", "Workspace URL", "Eligibility", "Check status", "Flawless submission", "Matching Assigned by", "Reason", "Evidence", "Phase", "Version", "Document Submitted"])
+    audit.append(["Source row", "Document ID", "Workspace URL", "Eligibility", "Check status", "Flawless submission", "Matching Assigned by", "Reason", "Evidence", "Phase", "Version", "Document Submitted",
+                  "Author Manager", "Organization", "Organization code", "WWID", "Organization lookup UTC", "Organization status"])
     counts, groups, group_labels = Counter(), {}, {}
     url_column = headers.index("Document WS URL")
     manager_column = headers.index("Author Manager")
@@ -108,6 +124,12 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
             continue
         row = dict(zip(headers, [c.value for c in cells]))
         decision = eligibility(row, config, book.epoch, now, reporting_month)
+        organization = organizations.get(normalized(row.get("Author Manager")))
+        if codes and decision.status != "Excluded":
+            if organization is None:
+                decision = Eligibility("Unverified", decision.reasons + ("Organization selection: identity unresolved",))
+            elif organization.organization_code not in codes:
+                decision = Eligibility("Excluded", decision.reasons + ("Organization code not selected",))
         ws_cell = cells[url_column]
         url = ws_cell.hyperlink.target if ws_cell.hyperlink else ""
         doc_id, canonical, link_error = "", "", ""
@@ -180,11 +202,21 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
             group = groups.setdefault(key, Counter())
             group["Qualified"] += 1
             group[value or "Unresolved Actions"] += 1
-            progress_group = (group_labels[key], group["Qualified"], group["Yes"], group["No"], group["Unresolved Actions"])
+            organization = organizations.get(key)
+            progress_group = (group_labels[key], organization.organization if organization else "Unresolved",
+                              group["Qualified"], group["Yes"], group["No"], group["Unresolved Actions"])
         counts[decision.status] += 1
         if link_error:
             reasons.append(link_error)
-        values = [cells[0].row, doc_id, canonical or url, decision.status, check, value, "; ".join(matches), "; ".join(dict.fromkeys(reasons)), reference, row["Phase"], row.get("Version"), row["Document Submitted"]]
+        key = normalized(row.get("Author Manager"))
+        organization = organizations.get(key)
+        organization_status = organization_issues.get(key, "Cached HR candidate; identity confirmed" if organization and organization.identity_confirmed == "yes"
+                                                      else "Unique active HR name candidate; not manually confirmed" if organization
+                                                      else "Identity unresolved: blank manager")
+        values = [cells[0].row, doc_id, canonical or url, decision.status, check, value, "; ".join(matches), "; ".join(dict.fromkeys(reasons)), reference, row["Phase"], row.get("Version"), row["Document Submitted"],
+                  row.get("Author Manager"), organization.organization if organization else "Unresolved",
+                  organization.organization_code if organization else "", organization.wwid if organization else "",
+                  organization.looked_up_utc if organization else "", organization_status]
         for column, val in enumerate(values, 1):
             cell = audit.cell(audit_row, column, val)
             if isinstance(val, str):
@@ -198,15 +230,19 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
             if decision.status == "Qualified":
                 document = {"result": value, "document": doc_id, "title": row.get("CCB Title"),
                             "manager": row.get("Author Manager"), "phase": row.get("Phase"),
+                            "organization": organization.organization if organization else "Unresolved",
                             "submitted": row.get("Document Submitted"), "url": url or canonical,
                             "matches": values[6], "reasons": values[7]}
             on_progress(dict(counts), progress_group, document)
     for key in sorted(groups, key=lambda value: (not bool(value), value)):
         group = groups[key]
-        managers.append([group_labels[key], group["Qualified"], group["Yes"], group["No"], group["Unresolved Actions"]])
+        organization = organizations.get(key)
+        managers.append([group_labels[key], organization.organization if organization else "Unresolved",
+                 group["Qualified"], group["Yes"], group["No"], group["Unresolved Actions"]])
         managers.cell(managers.max_row, 1).data_type = "s"
+        managers.cell(managers.max_row, 2).data_type = "s"
     pending = (counts["Unverified"] or counts["Unresolved Actions"]
-               or not config["assigned_by_names"] or config["action_scope"] != "document")
+               or organization_issues or not config["assigned_by_names"] or config["action_scope"] != "document")
     summary_rows = [["Metric", "Value"], ["Report status", "DRAFT - unresolved settings, eligibility or Actions" if pending else "Complete for configured rules"],
                     ["Business timezone", config["timezone"]], ["Month start inclusive", str(start)], ["Next month exclusive", str(end)],
                     ["Generated UTC", now.isoformat()], ["Source workbook", str(source)], ["Yes", counts["Yes"]], ["No", counts["No"]],
@@ -215,6 +251,9 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
                     ["Actions scope", config["action_scope"]], ["Phase rule", PHASE_RULE],
                     ["Reviewer rule", REVIEWER_RULE], ["Allowed reviewer names", "; ".join(config.get("reviewer_names", []))],
                     ["Grouping", "Author Manager; blank values retained"],
+                    ["Selected organization codes", "; ".join(codes) or "All organizations"],
+                    ["Organization basis", "Current active HR name candidates, not historical membership; no inferred KuAT hierarchy"],
+                    ["Organization lookup issues", len(organization_issues)],
                     ["Assigned by list configured", "Yes" if config["assigned_by_names"] else "No"]]
     for values in summary_rows:
         summary.append(values)
@@ -229,14 +268,39 @@ def report(source, output, config, evidence_dir, now=None, reader=None, *, on_pr
         for row_cells in tab:
             for c in row_cells:
                 c.alignment = Alignment(wrap_text=True, vertical="top")
-    for column in range(1, 13):
+    for column in range(1, 19):
         audit.column_dimensions[get_column_letter(column)].width = {1: 12, 2: 16, 3: 65, 7: 34, 8: 95, 9: 65}.get(column, 24)
     summary.column_dimensions["A"].width = 30
     summary.column_dimensions["B"].width = 100
     managers.column_dimensions["A"].width = 40
-    for column in "BCDE":
+    for column in "BCDEF":
         managers.column_dimensions[column].width = 24
-    result_sheet.auto_filter.ref = f"A1:AR{result_sheet.max_row}"
+    result_sheet.insert_cols(manager_index + 2)
+    organization_column = manager_index + 2
+    result_sheet.column_dimensions.clear()
+    for key, dimension in sheet.column_dimensions.items():
+        index = column_index_from_string(key)
+        target_index = index + (index >= organization_column)
+        target = result_sheet.column_dimensions[get_column_letter(target_index)]
+        for attribute in ("width", "hidden", "bestFit", "outlineLevel", "collapsed"):
+            setattr(target, attribute, getattr(dimension, attribute))
+        target.min = dimension.min + (dimension.min >= organization_column) if dimension.min else target_index
+        target.max = dimension.max + (dimension.max >= organization_column) if dimension.max else target_index
+        copy_style(dimension, target)
+    result_sheet.cell(1, organization_column, "Organization")
+    copy_style(result_sheet.cell(1, organization_column - 1), result_sheet.cell(1, organization_column))
+    result_sheet.column_dimensions[get_column_letter(organization_column)].width = 42
+    for row_number in range(2, result_sheet.max_row + 1):
+        manager = result_sheet.cell(row_number, organization_column - 1).value
+        organization = organizations.get(normalized(manager))
+        cell = result_sheet.cell(row_number, organization_column, organization.organization if organization else "Unresolved")
+        cell.data_type = "s"
+    for row_cells in result_sheet:
+        for cell in row_cells:
+            if cell.hyperlink:
+                cell.hyperlink.ref = cell.coordinate
+    result_sheet.column_dimensions["AS"].width = 24
+    result_sheet.auto_filter.ref = f"A1:AS{result_sheet.max_row}"
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = None
     try:
