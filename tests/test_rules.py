@@ -4,7 +4,7 @@ import pytest
 from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, to_excel
 
 from xccb_report.actions import parse_actions, workspace_identity
-from xccb_report.rules import (
+from xccb_report.filtering import (
     classify,
     eligibility,
     exact_name,
@@ -46,8 +46,9 @@ def test_complete_document_scope_with_zero_actions_classifies_yes():
                                                ("Any Other Person", "Excluded"),
                                                ("Doe, Jane; Smith, Alex", "Qualified"),
                                                ("Smith, Alex\n DOE,  Jane ", "Qualified"),
-                                               ("Doe, Jane Jr.", "Excluded")])
-def test_reviewer_accepts_listed_names_or_blanks(reviewers, expected):
+                                               ("Doe, Jane Jr.", "Qualified"),
+                                               ("Reviewer: Doe, Jane (Admin)", "Qualified")])
+def test_reviewer_is_blank_or_contains_a_listed_name(reviewers, expected):
     row, config, epoch, now = _eligibility_inputs()
     row["Reviewer(s)"] = reviewers
     assert eligibility(row, config, epoch, now).status == expected
@@ -92,8 +93,8 @@ def _eligibility_inputs(phase="Final", author_manager="Alice Manager", submitted
 
 
 @pytest.mark.parametrize("phase", [" \tFINAL\n ", "Preliminary", "Final Approval", "Do Not Implement",
-                                  "ATM Class III-N", "LSI Modification", "", None])
-def test_any_phase_without_wla_qualifies(phase):
+                                  "ATM Class III-N", "", None])
+def test_any_phase_without_excluded_text_qualifies(phase):
     row, config, epoch, now = _eligibility_inputs(phase=phase)
     assert eligibility(row, config, epoch, now).status == "Qualified"
 
@@ -109,6 +110,21 @@ def test_any_phase_containing_wla_is_excluded(phase):
     row, config, epoch, now = _eligibility_inputs(phase=phase)
     assert eligibility(row, config, epoch, now).status == "Excluded"
     assert any(reason.startswith("Phase contains WLA:") for reason in eligibility(row, config, epoch, now).reasons)
+
+
+@pytest.mark.parametrize("phase", ["LSI Modification", " lSi\tMODIFICATION ", "Final - LSI modification"])
+def test_any_phase_containing_lsi_modification_is_excluded(phase):
+    row, config, epoch, now = _eligibility_inputs(phase=phase)
+    result = eligibility(row, config, epoch, now)
+    assert result.status == "Excluded"
+    assert any(reason.startswith("Phase contains LSI modification:") for reason in result.reasons)
+
+
+@pytest.mark.parametrize("fyi", ["Yes", "No", "", None, True])
+def test_fyi_does_not_filter_eligibility(fyi):
+    row, config, epoch, now = _eligibility_inputs()
+    row["Is FYI?"] = fyi
+    assert eligibility(row, config, epoch, now).status == "Qualified"
 
 
 def test_eligibility_includes_malaysia_month_start_and_excludes_next_month_start():

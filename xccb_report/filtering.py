@@ -1,4 +1,5 @@
-"""Business rules, independent of the browser and workbook writer."""
+"""Submission filtering and classification, independent of browser and workbook I/O."""
+
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -6,8 +7,8 @@ import re
 
 from openpyxl.utils.datetime import from_excel
 
-PHASE_RULE = "All phases except values containing WLA (case-insensitive)"
-REVIEWER_RULE = "Listed reviewer names or blank Reviewer(s) cells"
+PHASE_RULE = "All phases except values containing WLA or LSI modification (case-insensitive)"
+REVIEWER_RULE = "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
 
 
 def normalized(value):
@@ -20,10 +21,8 @@ def exact_name(value, names):
 
 
 def reviewer_match(value, names):
-    if not normalized(value):
-        return True
-    # Commas belong to identities like 'Surname, Given name'.
-    return any(exact_name(part, names) for part in re.split(r"[;\r\n]+", str(value)))
+    value = normalized(value)
+    return not value or any(name and name in value for name in map(normalized, names))
 
 
 def submitted_date(value, epoch, timezone):
@@ -37,7 +36,9 @@ def submitted_date(value, epoch, timezone):
         return value
     if isinstance(value, str):
         try:
-            return submitted_date(datetime.fromisoformat(value.strip()), epoch, timezone)
+            return submitted_date(
+                datetime.fromisoformat(value.strip()), epoch, timezone
+            )
         except ValueError:
             pass
     raise ValueError("Missing or invalid Document Submitted date")
@@ -47,7 +48,9 @@ def month_bounds(now, timezone, reporting_month=None):
     if reporting_month is None:
         local = now.astimezone(ZoneInfo(timezone))
     else:
-        if not isinstance(reporting_month, str) or not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", reporting_month):
+        if not isinstance(reporting_month, str) or not re.fullmatch(
+            r"[0-9]{4}-(0[1-9]|1[0-2])", reporting_month
+        ):
             raise ValueError("Reporting month must be YYYY-MM")
         local = datetime.strptime(reporting_month, "%Y-%m")
     start = date(local.year, local.month, 1)
@@ -61,25 +64,45 @@ class Eligibility:
     reasons: tuple[str, ...] = ()
 
 
-def eligibility(row, config, epoch, now, reporting_month=None):
+def eligibility(row, config, epoch, now, reporting_month=None, *, all_dates=False):
     excluded, unresolved = [], []
     if "admin" not in normalized(row.get("Reviewing Forum")):
         excluded.append("Reviewing Forum does not contain admin")
-    if normalized(row.get("Is FYI?")) != "no":
-        excluded.append("Is FYI? is not No")
-    if "wla" in normalized(row.get("Phase")):
-        excluded.append(f"Phase contains WLA: {row.get('Phase')}")
+    phase = normalized(row.get("Phase"))
+    for text in ("WLA", "LSI modification"):
+        if normalized(text) in phase:
+            excluded.append(f"Phase contains {text}: {row.get('Phase')}")
     try:
-        start, end = month_bounds(now, config["timezone"], reporting_month)
-        if not start <= submitted_date(row.get("Document Submitted"), epoch, config["timezone"]) < end:
-            excluded.append("Document Submitted outside reporting month")
+        submitted = (
+            None if all_dates and "Document Submitted" not in row
+            else submitted_date(row.get("Document Submitted"), epoch, config["timezone"])
+        )
+        if not all_dates:
+            start, end = month_bounds(now, config["timezone"], reporting_month)
+            if not start <= submitted < end:
+                excluded.append("Document Submitted outside reporting month")
     except ValueError as exc:
         unresolved.append(str(exc))
     if not reviewer_match(row.get("Reviewer(s)"), config.get("reviewer_names", [])):
-        excluded.append("Reviewer(s) does not match the allowed name list")
+        excluded.append("Reviewer(s) does not contain a listed reviewer name")
     if excluded:
         return Eligibility("Excluded", tuple(excluded + unresolved))
     return Eligibility("Unverified" if unresolved else "Qualified", tuple(unresolved))
+
+
+def organization_eligibility(decision, organization, codes):
+    if not codes or decision.status == "Excluded":
+        return decision
+    if organization is None:
+        return Eligibility(
+            "Unverified",
+            decision.reasons + ("Organization selection: identity unresolved",),
+        )
+    if organization.organization_code not in codes:
+        return Eligibility(
+            "Excluded", decision.reasons + ("Organization code not selected",)
+        )
+    return decision
 
 
 def classify(actions, names, *, complete, scope):
@@ -87,7 +110,9 @@ def classify(actions, names, *, complete, scope):
         return "", [], "Actions scope unconfirmed or unsupported"
     if not names:
         return "", [], "Assigned by name list not configured"
-    matches = sorted({a["assigned_by"] for a in actions if exact_name(a.get("assigned_by"), names)})
+    matches = sorted(
+        {a["assigned_by"] for a in actions if exact_name(a.get("assigned_by"), names)}
+    )
     if matches:
         return "No", matches, "Matching Assigned by identity found"
     if not complete:

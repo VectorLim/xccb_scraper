@@ -21,7 +21,9 @@ HTML = '<body onclick="secret"><form><input name="__VIEWSTATE" value="secret"><!
 @pytest.fixture(autouse=True)
 def offline_organizations(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "private_user"))
-    monkeypatch.setattr("xccb_report.organizations.query_directory_batch", lambda *args: {})
+    monkeypatch.setattr(
+        "xccb_report.organizations.query_directory_batch", lambda *args: {}
+    )
 
 
 def config():
@@ -93,18 +95,88 @@ def test_report_preserves_links_and_caches_document(tmp_path, monkeypatch):
     assert counts["No"] == 2
     book = load_workbook(output)
     tab = book["Flawless submissions"]
-    assert tab.max_column == 45 and tab.max_row == 3
+    assert tab.max_column == 46 and tab.max_row == 3
     assert tab["A1"].fill.fgColor.rgb == "00123456"
     assert tab.column_dimensions["A"].fill.fgColor.rgb == "00ABCDEF"
-    assert tab["H2"].hyperlink.target == URL
-    assert tab["H2"].hyperlink.ref == "H2"
-    assert tab["AS2"].value == "No"
-    assert tab["J2"].data_type == "s" and tab["J2"].value.startswith("=HYPERLINK")
+    assert tab["I2"].hyperlink.target == URL
+    assert tab["I2"].hyperlink.ref == "I2"
+    assert tab["AT2"].value == "No"
+    assert tab["K2"].data_type == "s" and tab["K2"].value.startswith("=HYPERLINK")
+    assert tab["G1"].value == "Document" and tab["G2"].value is None
     assert book["Audit"].max_row == 3
-    assert tab.auto_filter.ref == "A1:AS3"
+    assert tab.auto_filter.ref == "A1:AT3"
     assert load_workbook(original).active.max_row == 5
     with pytest.raises(ValueError, match="never overwritten"):
         report(original, output, config(), tmp_path)
+
+
+@pytest.mark.parametrize("workspace_titles, expected", [
+    (["Whitepaper & document.docm"], "Whitepaper & document.docm"),
+    (["=A title, not a formula"], "=A title, not a formula"),
+    ([], ""),
+    (["First document.docx", "Second document.docx"], ""),
+])
+def test_document_title_is_between_phase_and_submitted_in_export_and_dashboard(
+    tmp_path, workspace_titles, expected
+):
+    from html import escape
+    from xccb_report.gui import DOCUMENT_COLUMNS
+    from xccb_report.results import read_results
+
+    original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
+    source(original)
+    book = load_workbook(original)
+    book.active["AQ3"] = "CCB Title"
+    book.active["AQ4"] = "Incorrect CCB title"
+    book.active["AQ5"] = "Another incorrect CCB title"
+    book.save(original)
+    book.close()
+
+    class Reader:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url):
+            self.urls.append(url)
+            if url == FRAME:
+                return HTML
+            return '<div id="ctl00_PlaceHolderContentDescription_ctl01_DocumentTitleCell">' + "".join(
+                '<a onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">'
+                + escape(title) + "</a>" for title in workspace_titles
+            ) + '</div><a id="ctl00_PlaceHolderToolbar_ctl00_tb_view" onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">V iew</a>' + '<iframe id="iFrameActions" src="DocumentComponents.aspx?Component=Actions&amp;DocumentID=123"></iframe>'
+
+    reader, progress = Reader(), []
+    report(
+        original, output, config(), tmp_path, reader=reader,
+        reporting_month="2026-10", on_progress=lambda *args: progress.append(args),
+    )
+    assert reader.urls == [URL, FRAME]
+    assert all(entry[2]["title"] == expected for entry in progress)
+    book = load_workbook(output)
+    sheet = book["Flawless submissions"]
+    headers = [cell.value for cell in sheet[1]]
+    phase = headers.index("Phase")
+    assert headers[phase:phase + 3] == ["Phase", "Document", "Document Submitted"]
+    assert "CCB Title" not in headers
+    assert (sheet.cell(2, phase + 2).value or "") == expected
+    assert (sheet.cell(3, phase + 2).value or "") == expected
+    if expected:
+        assert sheet.cell(3, phase + 2).data_type == "s"
+    else:
+        assert "Document title unavailable" in book["Audit"]["H2"].value
+    book.close()
+    _, _, documents = read_results(output)
+    columns = [column[1] for column in DOCUMENT_COLUMNS]
+    phase = columns.index("Phase")
+    assert columns[phase:phase + 3] == ["Phase", "Document", "Submitted"]
+    assert documents[0][phase + 1] == expected
+    assert documents[1][phase + 1] == expected
+    offline_output = tmp_path / "offline.xlsx"
+    report(original, offline_output, config(), tmp_path, reporting_month="2026-10")
+    assert read_results(offline_output)[2] == documents
+    book = load_workbook(original)
+    assert book.active["AQ3"].value == "CCB Title"
+    book.close()
 
 
 def test_empty_reviewer_list_includes_only_blank_reviewers(tmp_path):
@@ -126,14 +198,8 @@ def test_empty_reviewer_list_includes_only_blank_reviewers(tmp_path):
     book = load_workbook(output)
     assert book["Flawless submissions"].max_row == 2
     assert book["Summary"]["B2"].value.startswith("DRAFT")
-    assert list(book["By Author Manager"].values)[1] == (
-        "Manager, One",
-        "Unresolved",
-        1,
-        0,
-        0,
-        1,
-    )
+    assert book["By Author Manager"].max_row == 2
+    book.close()
 
 
 def test_reporting_month_does_not_change_evidence_time(tmp_path, monkeypatch):
@@ -206,6 +272,11 @@ def test_live_capture_uses_observed_frame_and_sanitizes(tmp_path):
         def get(self, url):
             self.urls.append(url)
             return (
+                '<div id="ctl00_PlaceHolderContentDescription_ctl01_DocumentTitleCell">'
+                'Different CCB heading [Class IV]'
+                '<a onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">'
+                'Whitepaper &amp; document.docm</a></div>'
+                '<a id="ctl00_PlaceHolderToolbar_ctl00_tb_view" onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">V iew</a>'
                 '<iframe id="iFrameActions" src="DocumentComponents.aspx?Component=Actions&amp;DocumentID=123"></iframe>'
                 if len(self.urls) == 1
                 else HTML
@@ -214,6 +285,7 @@ def test_live_capture_uses_observed_frame_and_sanitizes(tmp_path):
     reader = Reader()
     result = capture(reader, URL, tmp_path)
     assert reader.urls == [URL, FRAME]
+    assert result["document_title"] == "Whitepaper & document.docm"
     assert result["actions"] == [{"action_id": "1", "assigned_by": "Person, One"}]
     assert (
         result["complete"] is (not result["parse_errors"])
@@ -222,6 +294,15 @@ def test_live_capture_uses_observed_frame_and_sanitizes(tmp_path):
     clean = Path(result["source"]).read_text(encoding="utf-8")
     assert "secret" not in clean
     assert all(tag not in clean for tag in ("<form", "<input", "<script"))
+    assert "ViewOnlineDocument" not in clean
+    from datetime import timedelta
+    from xccb_report.evidence import load_document_title
+
+    now = datetime.now(timezone.utc)
+    assert load_document_title(tmp_path, "123", config(), now) == "Whitepaper & document.docm"
+    assert load_document_title(tmp_path, "123", config(), now + timedelta(days=2)) == ""
+    Path(result["source"]).write_text(clean + "tampered", encoding="utf-8")
+    assert load_document_title(tmp_path, "123", config(), now) == ""
 
 
 def test_live_capture_reports_deleted_document(tmp_path):
@@ -330,12 +411,15 @@ def test_legacy_phase_allowlist_is_ignored(tmp_path, caplog):
     assert "Ignoring obsolete filter setting: phases" in caplog.text
 
 
-def test_report_accepts_other_phases_but_excludes_wla(tmp_path):
+@pytest.mark.parametrize("excluded_phase", ["wLa CCB Final", "LSI Modification"])
+def test_report_applies_amended_filters(tmp_path, excluded_phase):
     original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
     source(original)
     book = load_workbook(original)
-    book.active["E4"] = "LSI Modification"
-    book.active["E5"] = "wLa CCB Final"
+    book.active["C4"] = "Reviewers: Reviewer, One (Admin)"
+    book.active["D4"] = "Yes"
+    book.active["E4"] = "Do Not Implement"
+    book.active["E5"] = excluded_phase
     book.save(original)
     book.close()
     counts = report(
@@ -347,14 +431,15 @@ def test_report_accepts_other_phases_but_excludes_wla(tmp_path):
     )
     assert counts["Qualified"] == 1 and counts["Excluded"] == 1
     book = load_workbook(output)
-    assert book["Flawless submissions"]["F2"].value == "LSI Modification"
+    assert book["Flawless submissions"]["F2"].value == "Do Not Implement"
     assert book["Flawless submissions"].max_row == 2
     summary = dict(book["Summary"].values)
     assert (
         summary["Phase rule"]
-        == "All phases except values containing WLA (case-insensitive)"
+        == "All phases except values containing WLA or LSI modification (case-insensitive)"
     )
-    assert "Phase contains WLA" in book["Audit"]["H3"].value
+    assert summary["Reviewer rule"] == "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
+    assert "Phase contains" in book["Audit"]["H3"].value
     book.close()
 
 
@@ -396,7 +481,7 @@ def test_report_groups_managers_without_excluding_missing_or_unmapped_names(tmp_
 def test_live_capture_is_not_future_dated_against_report_start(tmp_path, monkeypatch):
     original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
     source(original)
-    from xccb_report.rules import Eligibility
+    from xccb_report.filtering import Eligibility
 
     monkeypatch.setattr(
         "xccb_report.pipeline.eligibility", lambda *_: Eligibility("Qualified")
@@ -628,7 +713,7 @@ def test_dashboard_displays_progress_before_completion(tmp_path, monkeypatch):
         dashboard = Dashboard(root)
         assert dashboard.run_indicator.cget("text") == "Stopped"
         dashboard.source.set(str(original))
-        dashboard.month.set("2026-10")
+        assert not hasattr(dashboard, "month_picker")
         dashboard.reviewers.insert("1.0", "Reviewer, One\n")
         dashboard.start()
         assert dashboard.run_indicator.cget("text") == "Running"
@@ -720,7 +805,7 @@ def test_dashboard_generates_grouped_report_in_background(tmp_path, monkeypatch)
         assert not hasattr(dashboard, "settings")
         assert not hasattr(dashboard, "output")
         dashboard.source.set(str(original))
-        dashboard.month.set("2026-10")
+        assert dashboard.run_button.cget("text") == "Process"
         dashboard.evidence = tmp_path / "evidence"
         dashboard.reviewers.insert("1.0", "Reviewer, One\n")
         dashboard.start()
@@ -741,9 +826,9 @@ def test_dashboard_generates_grouped_report_in_background(tmp_path, monkeypatch)
             "0",
             "2",
         )
-        assert (tmp_path / "reviewer_names.txt").read_text(
-            encoding="utf-8"
-        ) == "Reviewer, One\n"
+        from xccb_report.config import load_preferences
+        assert load_preferences()["reviewer_names"] == ["Reviewer, One"]
+        assert not (tmp_path / "reviewer_names.txt").exists()
         rows = [
             dashboard.documents.item(item, "values")
             for item in dashboard.documents.get_children()
@@ -775,20 +860,12 @@ def test_dashboard_generates_grouped_report_in_background(tmp_path, monkeypatch)
             len(temporary_outputs) == 2 and temporary_outputs[0] != temporary_outputs[1]
         )
         assert dashboard.card_values["Qualified"].get() == "0"
-        assert dashboard.status.get().startswith("No matching submissions for 2026-10")
+        assert dashboard.status.get().startswith("No matching submissions")
         assert not dashboard.table.get_children()
         assert not dashboard.documents.get_children()
         assert all(not path.exists() for path in temporary_outputs)
         assert list(tmp_path.glob("*.xlsx")) == [original]
-        assert (tmp_path / "reviewer_names.txt").read_text(
-            encoding="utf-8"
-        ) == "Other Reviewer\n"
-        dashboard.month.set("2026-13")
-        dashboard.start()
-        assert errors and "valid reporting month" in errors[-1][1]
-        assert not dashboard.running
-        errors.clear()
-        dashboard.month.set("2026-10")
+        assert load_preferences()["reviewer_names"] == ["Other Reviewer"]
         dashboard.source.set(str(tmp_path / "missing.xlsx"))
         dashboard.start()
         assert errors and "existing source workbook" in errors[0][1]
@@ -834,7 +911,7 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
 
         root.deiconify()
         root.update()
-        popup = dashboard.open_column_filter(3)
+        popup = dashboard.open_column_filter(2)
         widgets = list(descendants(popup))
         next(
             widget
@@ -854,7 +931,7 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
         ).invoke()
         assert visible() == ["0", "1"]
         assert dashboard.documents.heading("manager", "text").endswith("●")
-        popup = dashboard.open_column_filter(3)
+        popup = dashboard.open_column_filter(2)
         widgets = list(descendants(popup))
         next(widget for widget in widgets if isinstance(widget, ttk.Entry)).insert(
             0, "MANAGER B"
@@ -874,9 +951,9 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
             for widget in widgets
             if isinstance(widget, ttk.Button) and widget.cget("text") == "Cancel"
         ).invoke()
-        assert dashboard.column_filters == {3: {"Manager A"}}
+        assert dashboard.column_filters == {2: {"Manager A"}}
         assert visible() == ["0", "1"]
-        popup = dashboard.open_column_filter(3)
+        popup = dashboard.open_column_filter(2)
         widgets = list(descendants(popup))
         next(
             widget
@@ -890,8 +967,8 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
         ).invoke()
         assert not dashboard.column_filters
         assert visible() == ["0", "1", "2", "3"]
-        dashboard.column_filters[3] = {"Manager A"}
-        dashboard.column_filters[5] = {"P"}
+        dashboard.column_filters[2] = {"Manager A"}
+        dashboard.column_filters[4] = {"P"}
         dashboard.render_documents()
         assert visible() == ["0"]
         dashboard.result_filter.set("No")
@@ -914,10 +991,10 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
         dashboard.column_filters[0] = {"Unresolved"}
         dashboard.render_documents()
         assert visible() == ["2"]
-        dashboard.column_filters = {3: {""}}
+        dashboard.column_filters = {2: {""}}
         dashboard.render_documents()
         assert visible() == ["3"]
-        dashboard.column_filters = {3: set()}
+        dashboard.column_filters = {2: set()}
         dashboard.render_documents()
         assert visible() == []
         dashboard.clear_document_filters()
@@ -927,14 +1004,41 @@ def test_dashboard_column_filters(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_json_preferences_import_names_once_and_preserve_other_settings(tmp_path):
+    from xccb_report.config import load_preferences, save_preferences
+    from xccb_report.organizations import load_settings, save_settings
+
+    legacy = tmp_path / "reviewer_names.txt"
+    legacy.write_text("Doe, Jane\n", encoding="utf-8")
+    save_settings(["04643"])
+    assert load_preferences(legacy)["reviewer_names"] == ["Doe, Jane"]
+    legacy.write_text("Other Person\n", encoding="utf-8")
+    save_preferences({"column_filters": {"Phase": {"mode": "value", "values": ["Final"]}}})
+    preferences = load_preferences(legacy)
+    assert preferences["reviewer_names"] == ["Doe, Jane"]
+    assert preferences["column_filters"]["Phase"]["values"] == ["Final"]
+    assert load_settings()["organization_codes"] == ["04643"]
+
+
+def test_json_preferences_need_no_organization_fields(tmp_path):
+    from xccb_report.config import load_preferences
+    from xccb_report.organizations import user_directory
+
+    path = user_directory() / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"reviewer_names": ["Doe, Jane"], "column_filters": {}}), encoding="utf-8")
+    assert load_preferences()["reviewer_names"] == ["Doe, Jane"]
+
+
 def test_reviewer_txt_persists_names_and_overrides_config(tmp_path):
-    from xccb_report.reviewers import load_names, save_names
+    from xccb_report.reviewers import load_names, parse_names
 
     path = tmp_path / "reviewer_names.txt"
-    assert save_names(path, "Doe, Jane\n \n doe,  JANE\nSmith, Alex\n") == [
+    assert parse_names("Doe, Jane\n \n doe,  JANE\nSmith, Alex\n") == [
         "Doe, Jane",
         "Smith, Alex",
     ]
+    path.write_text("Doe, Jane\nSmith, Alex\n", encoding="utf-8")
     assert load_names(path) == ["Doe, Jane", "Smith, Alex"]
     path.write_text("\ufeffNew Reviewer\n", encoding="utf-8")
     config_path = tmp_path / "config.json"
@@ -943,12 +1047,12 @@ def test_reviewer_txt_persists_names_and_overrides_config(tmp_path):
     )
     assert load_config(config_path)["reviewer_names"] == ["New Reviewer"]
     assert load_config(config_path)["assigned_by_names"] == ["New Reviewer"]
-    assert save_names(path, "\n \n") == []
-    assert load_names(path) == []
+    assert parse_names("\n \n") == []
 
 
-def test_dashboard_loads_and_reloads_reviewer_txt(tmp_path, monkeypatch):
+def test_dashboard_loads_legacy_names_once_then_reloads_json(tmp_path, monkeypatch):
     import tkinter as tk
+    from xccb_report.config import save_preferences
     from xccb_report.gui import Dashboard
 
     monkeypatch.chdir(tmp_path)
@@ -959,7 +1063,7 @@ def test_dashboard_loads_and_reloads_reviewer_txt(tmp_path, monkeypatch):
     try:
         dashboard = Dashboard(root)
         assert dashboard.reviewers.get("1.0", "end").strip() == "Doe, Jane\nSmith, Alex"
-        path.write_text("New Reviewer\n", encoding="utf-8")
+        save_preferences({"reviewer_names": ["New Reviewer"]})
         dashboard.reload_reviewers()
         assert dashboard.reviewers.get("1.0", "end").strip() == "New Reviewer"
         root.deiconify()
@@ -984,5 +1088,100 @@ def test_dashboard_loads_and_reloads_reviewer_txt(tmp_path, monkeypatch):
                     widget.winfo_rooty() + widget.winfo_height()
                     <= root.winfo_rooty() + root.winfo_height()
                 )
+    finally:
+        root.destroy()
+
+
+def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(tmp_path, monkeypatch):
+    import tkinter as tk
+    from tkinter import ttk
+    from xccb_report.config import load_preferences, save_preferences
+    from xccb_report.gui import Dashboard
+    from xccb_report.results import document_row
+
+    monkeypatch.chdir(tmp_path)
+    save_preferences({
+        "reviewer_names": ["Doe, Jane"],
+        "column_filters": {
+            "Submitted": {"mode": "month", "values": ["2026-10"]},
+            "Missing workbook column": {"mode": "value", "values": ["irrelevant"]},
+        },
+    })
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        dashboard = Dashboard(root)
+        dashboard.documents_data = [
+            document_row("Yes", "1", "Title", "Manager", "Final", datetime(2026, 10, 1), URL, "", ""),
+            document_row("Yes", "2", "Title", "Manager", "Final", datetime(2026, 10, 12), URL, "", ""),
+            document_row("Yes", "3", "Title", "Manager", "Final", datetime(2026, 9, 1), URL, "", ""),
+        ]
+        dashboard.render_documents()
+        assert len(dashboard.documents.get_children()) == 2
+        assert set(dashboard.column_filters) == {6}
+        dashboard.date_modes[6] = "day"
+        dashboard.column_filters[6] = {"2026-10-12"}
+        dashboard.save_table_filters()
+        dashboard.render_documents()
+        assert len(dashboard.documents.get_children()) == 1
+        assert load_preferences()["column_filters"]["Submitted"] == {"mode": "day", "values": ["2026-10-12"]}
+        root.deiconify()
+        root.update()
+        popup = dashboard.open_column_filter(6)
+        picker = next(widget for widget in popup.winfo_children() if isinstance(widget, ttk.Combobox))
+        picker.set("Month")
+        picker.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert dashboard.date_modes[6] == "month"
+        assert 6 not in dashboard.column_filters
+        dashboard.close_column_filter()
+        restarted = tk.Toplevel(root)
+        second = Dashboard(restarted)
+        assert second.date_modes[6] == "month"
+        assert 6 not in second.column_filters
+        assert second.reviewers.get("1.0", "end").strip() == "Doe, Jane"
+        restarted.destroy()
+    finally:
+        root.destroy()
+
+
+def test_all_dates_processing_does_not_change_default_cli_month(tmp_path):
+    original = tmp_path / "source.xlsx"
+    source(original)
+    now = datetime(2026, 11, 4, tzinfo=timezone.utc)
+    current = report(original, tmp_path / "current.xlsx", config(), tmp_path, now=now)
+    all_dates = report(original, tmp_path / "all.xlsx", config(), tmp_path, now=now, all_dates=True)
+    assert current.get("Qualified", 0) == 0
+    assert all_dates["Qualified"] == 2
+
+
+@pytest.mark.parametrize("missing, column", [("Phase", "phase"), ("Document Submitted", "submitted")])
+def test_missing_optional_workbook_columns_are_hidden_and_not_filtered(tmp_path, monkeypatch, missing, column):
+    import tkinter as tk
+    from xccb_report.config import save_preferences
+    from xccb_report.gui import Dashboard, DOCUMENT_COLUMNS
+    from xccb_report.results import read_results
+
+    monkeypatch.chdir(tmp_path)
+    original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
+    source(original)
+    book = load_workbook(original)
+    index = next(cell.column for cell in book.active[3] if cell.value == missing)
+    book.active.delete_cols(index)
+    book.save(original)
+    book.close()
+    title = next(title for name, title, _ in DOCUMENT_COLUMNS if name == column)
+    save_preferences({"column_filters": {title: {"mode": "value", "values": ["not present"]}}})
+    counts = report(original, output, config(), tmp_path, all_dates=True)
+    assert counts["Qualified"] == 2
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        dashboard = Dashboard(root)
+        dashboard.configure_workbook_columns(original)
+        dashboard.documents_data = read_results(output)[2]
+        dashboard.render_documents()
+        assert column not in dashboard.documents.cget("displaycolumns")
+        assert len(dashboard.documents.get_children()) == 2
     finally:
         root.destroy()

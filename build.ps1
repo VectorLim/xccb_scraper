@@ -14,8 +14,4 @@ $hrHelper = & $Python -c "import importlib.util, pathlib; print(pathlib.Path(imp
 if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the DataSyncX HR helper' }
 & $Python -m PyInstaller --noconfirm --clean --log-level WARN --onefile --windowed --name xCCB_Report --distpath $DistPath --collect-all tzdata --collect-data datasyncx --copy-metadata datasyncx --collect-submodules oracledb --add-data "${hrHelper};datasyncx\utils" dashboard.py
 if ($LASTEXITCODE -ne 0) { throw 'Executable build failed' }
-$reviewerPath = Join-Path (Join-Path $PSScriptRoot $DistPath) 'reviewer_names.txt'
-if (-not (Test-Path -LiteralPath $reviewerPath)) {
-    [System.IO.File]::WriteAllText($reviewerPath, '')
-}
 Write-Output ("Built " + (Join-Path $DistPath 'xCCB_Report.exe'))

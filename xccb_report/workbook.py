@@ -8,15 +8,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import column_index_from_string, get_column_letter
 
-from .rules import normalized
+from .filtering import normalized
 
 REQUIRED = {
     "Author Manager",
     "Reviewing Forum",
-    "Reviewer(s)",
-    "Is FYI?",
-    "Phase",
-    "Document Submitted",
     "Document WS URL",
 }
 AUDIT_HEADERS = [
@@ -56,8 +52,8 @@ def read_source(path):
         raise ValueError("Expected exactly one report sheet with headers on row 3")
     sheet = sheets[0]
     headers = [c.value for c in sheet[3]]
-    if len(headers) != 43 or len(set(headers)) != 43 or any(not h for h in headers):
-        raise ValueError("Expected 43 unique original columns A:AQ")
+    if len(set(headers)) != len(headers) or any(not h for h in headers):
+        raise ValueError("Expected unique nonblank source column headers")
     return workbook, sheet, headers
 
 
@@ -81,32 +77,42 @@ class ReportWriter:
         self.audit = self.book.create_sheet("Audit")
         self.managers = self.book.create_sheet("By Author Manager")
         self.managers.append(MANAGER_HEADERS)
-        for key, dimension in sheet.column_dimensions.items():
-            target_dimension = self.results.column_dimensions[key]
-            for attribute in (
-                "width",
-                "hidden",
-                "bestFit",
-                "min",
-                "max",
-                "outlineLevel",
-                "collapsed",
-            ):
-                setattr(target_dimension, attribute, getattr(dimension, attribute))
-            copy_style(dimension, target_dimension)
-        for column, cell in enumerate(sheet[3], 1):
-            target = self.results.cell(1, column, cell.value)
+        title_column = next(
+            (cell.column for cell in sheet[3] if cell.value == "CCB Title"),
+            None,
+        )
+        self.columns = [
+            (cell.column, cell.value) for cell in sheet[3]
+            if cell.column != title_column
+        ]
+        phase = next(
+            (index for index, (_, name) in enumerate(self.columns) if name == "Phase"),
+            next((index - 1 for index, (_, name) in enumerate(self.columns) if name == "Document Submitted"), len(self.columns) - 1),
+        )
+        self.columns.insert(phase + 1, (title_column, "Document"))
+        for column, (source_column, name) in enumerate(self.columns, 1):
+            cell = sheet.cell(3, source_column) if source_column else sheet.cell(3, 1)
+            target = self.results.cell(1, column, name)
             copy_style(cell, target)
             target.alignment = Alignment(wrap_text=True, vertical="top")
-        self.results.cell(1, 44, "Flawless submission")
-        self.results.cell(1, 44)._style = copy(self.results.cell(1, 43)._style)
-        self.results.column_dimensions["AR"].width = 24
+        result_column = len(self.columns) + 1
+        self.results.cell(1, result_column, "Flawless submission")
+        self.results.cell(1, result_column)._style = copy(self.results.cell(1, result_column - 1)._style)
         self.results.row_dimensions[1].height = 75
         self.results.freeze_panes = "A2"
         self.audit.append(AUDIT_HEADERS)
 
-    def add_submission(self, target_row, cells, value):
-        for column, cell in enumerate(cells, 1):
+    def add_submission(self, target_row, cells, value, document_title=""):
+        for column, (source_column, name) in enumerate(self.columns, 1):
+            if name == "Document":
+                target = self.results.cell(target_row, column, document_title or None)
+                target.data_type = "s"
+                if source_column is not None:
+                    copy_style(cells[source_column - 1], target)
+                continue
+            if source_column is None:
+                continue
+            cell = cells[source_column - 1]
             target = self.results.cell(target_row, column, cell.value)
             target.data_type = cell.data_type
             copy_style(cell, target)
@@ -118,7 +124,7 @@ class ReportWriter:
         self.results.row_dimensions[target_row].height = self.source.row_dimensions[
             cells[0].row
         ].height
-        self.results.cell(target_row, 44, value or None)
+        self.results.cell(target_row, len(self.columns) + 1, value or None)
 
     def add_audit(self, audit_row, values, canonical):
         for column, val in enumerate(values, 1):
@@ -168,22 +174,32 @@ class ReportWriter:
         for column in "BCDEF":
             self.managers.column_dimensions[column].width = 24
         results = self.results
-        results.insert_cols(manager_index + 2)
-        organization_column = manager_index + 2
+        organization_column = next(
+            column + 1 for column, (source_column, _) in enumerate(self.columns, 1)
+            if source_column == manager_index + 1
+        )
+        results.insert_cols(organization_column)
+        column_positions = {
+            source_column: column + (column >= organization_column)
+            for column, (source_column, _) in enumerate(self.columns, 1)
+            if source_column is not None
+        }
         results.column_dimensions.clear()
         for key, dimension in self.source.column_dimensions.items():
             index = column_index_from_string(key)
-            target_index = index + (index >= organization_column)
+            target_index = column_positions.get(index)
+            if target_index is None:
+                continue
             target = results.column_dimensions[get_column_letter(target_index)]
             for attribute in ("width", "hidden", "bestFit", "outlineLevel", "collapsed"):
                 setattr(target, attribute, getattr(dimension, attribute))
             target.min = (
-                dimension.min + (dimension.min >= organization_column)
+                column_positions.get(dimension.min, target_index)
                 if dimension.min
                 else target_index
             )
             target.max = (
-                dimension.max + (dimension.max >= organization_column)
+                column_positions.get(dimension.max, target_index)
                 if dimension.max
                 else target_index
             )
@@ -207,8 +223,11 @@ class ReportWriter:
             for cell in row_cells:
                 if cell.hyperlink:
                     cell.hyperlink.ref = cell.coordinate
-        results.column_dimensions["AS"].width = 24
-        results.auto_filter.ref = f"A1:AS{results.max_row}"
+        document_column = next(cell.column for cell in results[1] if cell.value == "Document")
+        results.column_dimensions[get_column_letter(document_column)].width = 60
+        last_column = get_column_letter(results.max_column)
+        results.column_dimensions[last_column].width = 24
+        results.auto_filter.ref = f"A1:{last_column}{results.max_row}"
 
     def save(self, output):
         output = Path(output)

@@ -1,7 +1,6 @@
 """Desktop dashboard for the same report pipeline used by the CLI."""
 
 from copy import deepcopy
-from datetime import datetime, timezone
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -12,16 +11,16 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import filedialog, messagebox, ttk
 import webbrowser
-from zoneinfo import ZoneInfo
 
 from .actions import workspace_identity
-from .config import DEFAULTS, load_config
+from .config import DEFAULTS, load_config, load_preferences, save_preferences
 from .organizations import OrganizationCache, load_settings
 from .pipeline import report
 from .results import document_row, read_results
+from .workbook import read_source
 from .site import WindowsReader
-from .reviewers import load_names, parse_names, save_names
-from .rules import month_bounds, normalized
+from .reviewers import parse_names
+from .filtering import normalized
 
 CARDS = (
     ("Qualified", "Qualified"),
@@ -33,10 +32,10 @@ CARDS = (
 DOCUMENT_COLUMNS = (
     ("result", "Flawless", 80),
     ("document", "Document ID", 95),
-    ("title", "CCB Title", 300),
     ("manager", "Author Manager", 170),
     ("organization", "Organization", 240),
     ("phase", "Phase", 100),
+    ("title", "Document", 300),
     ("submitted", "Submitted", 95),
     ("url", "Document WS URL", 420),
     ("notes", "Notes", 200),
@@ -76,13 +75,18 @@ class Dashboard:
         home = (
             Path(sys.executable).parent if getattr(sys, "frozen", False) else Path.cwd()
         )
-        self.reviewer_path = home / "reviewer_names.txt"
         config_path = home / "config.json"
         if config_path.exists():
             try:
                 self.config = load_config(config_path)
             except Exception as exc:
                 messagebox.showerror("Configuration error", str(exc), parent=root)
+        try:
+            self.preferences = load_preferences(home / "reviewer_names.txt")
+        except (OSError, ValueError) as exc:
+            self.preferences = {}
+            self.organization_error = str(exc)
+            messagebox.showerror("Settings error", str(exc), parent=root)
         self.configure_styles()
 
         frame = ttk.Frame(root, padding=12)
@@ -98,8 +102,8 @@ class Dashboard:
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="Admin forum · Is FYI? = No · listed or blank reviewers · Phase excludes WLA · "
-            "selected month · Actions checked live on xCCB",
+            text="Admin forum · listed or blank reviewers · Phase excludes WLA / LSI modification · "
+            "Actions checked live on xCCB",
             style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="w")
 
@@ -108,26 +112,14 @@ class Dashboard:
         toolbar = ttk.Frame(frame)
         toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         toolbar.columnconfigure(1, weight=1)
-        ttk.Button(toolbar, text="Workbook…", command=self.choose_source).grid(
+        ttk.Button(toolbar, text="Upload", command=self.choose_source).grid(
             row=0, column=0, padx=(0, 6)
         )
         ttk.Entry(toolbar, textvariable=self.source, width=20).grid(
             row=0, column=1, sticky="ew"
         )
-        current = datetime.now(ZoneInfo(self.config["timezone"]))
-        self.month = tk.StringVar(value=current.strftime("%Y-%m"))
-        month_index = current.year * 12 + current.month - 1
-        months = [
-            f"{(month_index - offset) // 12:04d}-{(month_index - offset) % 12 + 1:02d}"
-            for offset in range(24)
-        ]
-        ttk.Label(toolbar, text="Month").grid(row=0, column=2, padx=(10, 4))
-        self.month_picker = ttk.Combobox(
-            toolbar, textvariable=self.month, values=months, width=8
-        )
-        self.month_picker.grid(row=0, column=3)
         self.run_button = ttk.Button(
-            toolbar, text="Refresh", command=self.start, style="Accent.TButton"
+            toolbar, text="Process", command=self.start, style="Accent.TButton"
         )
         self.run_button.grid(row=0, column=4, padx=(8, 0))
         self.stop_button = ttk.Button(
@@ -172,7 +164,7 @@ class Dashboard:
         footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
         self.status = tk.StringVar(
-            value="Choose a workbook, check the listed names, then press Refresh."
+            value="Upload a workbook, check the listed names, then press Process."
         )
         ttk.Label(footer, textvariable=self.status, style="Muted.TLabel").grid(
             row=0, column=0, sticky="w"
@@ -259,14 +251,14 @@ class Dashboard:
         ttk.Button(buttons, text="Save list", command=self.save_reviewers).pack(
             side="left"
         )
-        ttk.Button(buttons, text="Reload TXT", command=self.reload_reviewers).pack(
+        ttk.Button(buttons, text="Reload settings", command=self.reload_reviewers).pack(
             side="left", padx=(6, 0)
         )
         self.reviewer_status = tk.StringVar()
         ttk.Label(panel, textvariable=self.reviewer_status, style="Muted.TLabel").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
-        if self.reviewer_path.exists():
+        if "reviewer_names" in self.preferences:
             self.reload_reviewers()
         else:
             names = parse_names(
@@ -278,7 +270,8 @@ class Dashboard:
             self.count_names()
 
     def build_documents_tab(self):
-        self.column_filters = {}
+        self.load_table_filters()
+        self.available_columns = {column[0] for column in DOCUMENT_COLUMNS}
         tab = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(tab, text="Submissions")
         tab.columnconfigure(0, weight=1)
@@ -405,40 +398,95 @@ class Dashboard:
         count = len(parse_names(self.reviewers.get("1.0", "end")))
         self.reviewer_status.set(f"{count} name{'s' if count != 1 else ''}")
 
-    @staticmethod
-    def column_value(row, index):
-        return (row[index] or "Unresolved") if index == 0 else row[index]
+    def column_value(self, row, index):
+        value = (row[index] or "Unresolved") if index == 0 else row[index]
+        if DOCUMENT_COLUMNS[index][0] == "submitted" and self.date_modes.get(index) == "month":
+            return value[:7]
+        return value
+
+    def load_table_filters(self):
+        self.column_filters, self.date_modes = {}, {}
+        for index, (_, title, _) in enumerate(DOCUMENT_COLUMNS):
+            selection = self.preferences.get("column_filters", {}).get(title)
+            if selection is not None:
+                if not selection.get("all", False):
+                    self.column_filters[index] = set(selection["values"])
+                if title == "Submitted":
+                    self.date_modes[index] = "month" if selection.get("mode") == "month" else "day"
+
+    def save_table_filters(self):
+        filters = {
+            DOCUMENT_COLUMNS[index][1]: {
+                "mode": self.date_modes.get(index, "day") if DOCUMENT_COLUMNS[index][0] == "submitted" else "value",
+                "values": sorted(values),
+            }
+            for index, values in self.column_filters.items()
+        }
+        for index, mode in self.date_modes.items():
+            if index not in self.column_filters:
+                filters[DOCUMENT_COLUMNS[index][1]] = {"mode": mode, "values": [], "all": True}
+        try:
+            save_preferences({"column_filters": filters})
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Cannot save filters", str(exc), parent=self.root)
 
     def open_column_filter(self, index):
         self.close_column_filter()
+        if DOCUMENT_COLUMNS[index][0] not in self.available_columns:
+            return None
         _, title, _ = DOCUMENT_COLUMNS[index]
         values = {self.column_value(row, index) for row in self.documents_data}
         values.update(self.column_filters.get(index, ()))
         popup = ttk.Frame(self.root, relief="solid", borderwidth=1)
         self.filter_popup = popup
         self.root.update_idletasks()
-        widths = [int(self.documents.column(column, "width")) for column, _, _ in DOCUMENT_COLUMNS]
-        offset = sum(widths[:index]) - self.documents.xview()[0] * sum(widths)
+        widths = [
+            int(self.documents.column(column, "width"))
+            for column, _, _ in DOCUMENT_COLUMNS
+            if column in self.available_columns
+        ]
+        visible_index = sum(column in self.available_columns for column, _, _ in DOCUMENT_COLUMNS[:index])
+        offset = sum(widths[:visible_index]) - self.documents.xview()[0] * sum(widths)
         width = min(self.px(380), self.root.winfo_width() - 16)
         left = self.documents.winfo_rootx() - self.root.winfo_rootx() + round(offset)
         left = max(8, min(left, self.root.winfo_width() - width - 8))
-        top = self.documents.winfo_rooty() - self.root.winfo_rooty() + self.heading_font.metrics("linespace") + self.px(10)
+        top = (
+            self.documents.winfo_rooty()
+            - self.root.winfo_rooty()
+            + self.heading_font.metrics("linespace")
+            + self.px(10)
+        )
         height = min(self.px(440), self.root.winfo_height() - top - 8)
         popup.place(x=left, y=top, width=width, height=max(self.px(180), height))
         popup.lift()
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(3, weight=1)
-        ttk.Label(popup, text=title, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+        ttk.Label(popup, text=title, font=("Segoe UI Semibold", 10)).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 0)
+        )
+        if DOCUMENT_COLUMNS[index][0] == "submitted":
+            mode = tk.StringVar(value=self.date_modes.get(index, "day").title())
+            picker = ttk.Combobox(popup, textvariable=mode, values=("Month", "Day"), state="readonly", width=8)
+            picker.grid(row=0, column=1, padx=8, pady=(6, 0))
+
+            def change_mode(_event):
+                self.date_modes[index] = mode.get().lower()
+                self.column_filters.pop(index, None)
+                self.save_table_filters()
+                self.open_column_filter(index)
+                self.render_documents()
+
+            picker.bind("<<ComboboxSelected>>", change_mode)
         query = tk.StringVar()
         entry = ttk.Entry(popup, textvariable=query)
-        entry.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
         selected = self.column_filters.get(index, values)
         choices = {
             value: tk.BooleanVar(value=value in selected)
             for value in sorted(values, key=normalized)
         }
         buttons = ttk.Frame(popup)
-        buttons.grid(row=2, column=0, sticky="ew", padx=8)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8)
 
         def select_visible(state):
             for value, variable in choices.items():
@@ -452,7 +500,7 @@ class Dashboard:
             buttons, text="Select none", command=lambda: select_visible(False)
         ).pack(side="left", padx=6)
         area = ttk.Frame(popup)
-        area.grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
+        area.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
         area.columnconfigure(0, weight=1)
         area.rowconfigure(0, weight=1)
         canvas = tk.Canvas(area, highlightthickness=0)
@@ -502,20 +550,30 @@ class Dashboard:
                 self.column_filters.pop(index, None)
             else:
                 self.column_filters[index] = chosen
+            self.save_table_filters()
             self.close_column_filter()
             self.render_documents()
 
         footer = ttk.Frame(popup)
-        footer.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        footer.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         if DOCUMENT_COLUMNS[index][0] == "organization":
+
             def refresh_organizations():
                 self.organization_refresh = True
                 self.close_column_filter()
                 self.start()
-            ttk.Button(footer, text="Refresh organizations", command=refresh_organizations,
-                       state="disabled" if self.running else "normal").pack(side="left")
-        ttk.Button(footer, text="Cancel", command=self.close_column_filter).pack(side="right")
+
+            ttk.Button(
+                footer,
+                text="Refresh organizations",
+                command=refresh_organizations,
+                state="disabled" if self.running else "normal",
+            ).pack(side="left")
+        ttk.Button(footer, text="Cancel", command=self.close_column_filter).pack(
+            side="right"
+        )
         ttk.Button(footer, text="Apply", command=apply).pack(side="right", padx=6)
+
         def outside_click(event):
             widget = event.widget
             while widget is not None:
@@ -523,12 +581,20 @@ class Dashboard:
                     return
                 widget = getattr(widget, "master", None)
             self.close_column_filter()
+
         def resize(event):
             if event.widget == self.root:
                 self.close_column_filter()
-        for sequence, callback in (("<Button-1>", outside_click), ("<Escape>", lambda _event: self.close_column_filter()),
-                                   ("<Configure>", resize), ("<Return>", lambda _event: apply())):
-            self.filter_bindings.append((sequence, self.root.bind(sequence, callback, add="+")))
+
+        for sequence, callback in (
+            ("<Button-1>", outside_click),
+            ("<Escape>", lambda _event: self.close_column_filter()),
+            ("<Configure>", resize),
+            ("<Return>", lambda _event: apply()),
+        ):
+            self.filter_bindings.append(
+                (sequence, self.root.bind(sequence, callback, add="+"))
+            )
         entry.focus_set()
         return popup
 
@@ -542,6 +608,8 @@ class Dashboard:
 
     def clear_document_filters(self):
         self.column_filters.clear()
+        self.date_modes.clear()
+        self.save_table_filters()
         self.result_filter.set("All")
         self.search.set("")
         self.render_documents()
@@ -557,6 +625,7 @@ class Dashboard:
         if any(
             self.column_value(row, index) not in selected
             for index, selected in self.column_filters.items()
+            if DOCUMENT_COLUMNS[index][0] in self.available_columns
         ):
             return
         self.documents.insert(
@@ -680,13 +749,35 @@ class Dashboard:
             parent=self.root, filetypes=[("Excel workbook", "*.xlsx")]
         )
         if path:
+            try:
+                self.configure_workbook_columns(path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("Upload failed", str(exc), parent=self.root)
+                return
             self.source.set(path)
             self.status.set("Ready")
 
+    def configure_workbook_columns(self, path):
+        book, _, headers = read_source(path)
+        book.close()
+        sources = {
+            "manager": "Author Manager", "phase": "Phase",
+            "submitted": "Document Submitted", "url": "Document WS URL",
+        }
+        self.available_columns = {
+            column for column, _, _ in DOCUMENT_COLUMNS
+            if column not in sources or sources[column] in headers
+        }
+        self.documents.configure(displaycolumns=[
+            column for column, _, _ in DOCUMENT_COLUMNS if column in self.available_columns
+        ])
+        self.render_documents()
+
     def save_reviewers(self):
         try:
-            names = save_names(self.reviewer_path, self.reviewers.get("1.0", "end"))
-        except OSError as exc:
+            names = parse_names(self.reviewers.get("1.0", "end"))
+            save_preferences({"reviewer_names": names})
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Cannot save listed names", str(exc), parent=self.root)
             return None
         self.reviewer_status.set(
@@ -706,12 +797,16 @@ class Dashboard:
 
     def reload_reviewers(self):
         try:
-            names = load_names(self.reviewer_path)
-        except (OSError, UnicodeError) as exc:
+            self.preferences = load_preferences()
+            names = self.preferences.get("reviewer_names", [])
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Cannot read listed names", str(exc), parent=self.root)
             return
         self.reviewers.delete("1.0", "end")
         self.reviewers.insert("1.0", "\n".join(names))
+        if hasattr(self, "documents"):
+            self.load_table_filters()
+            self.render_documents()
         self.reviewer_status.set(
             f"Loaded {len(names)} name{'s' if len(names) != 1 else ''}"
         )
@@ -733,17 +828,11 @@ class Dashboard:
                 parent=self.root,
             )
             return
-        selected_month = self.month.get().strip()
+        selected_month = None
         try:
-            month_bounds(
-                datetime.now(timezone.utc), self.config["timezone"], selected_month
-            )
-        except ValueError:
-            messagebox.showerror(
-                "Choose month",
-                "Enter a valid reporting month as YYYY-MM.",
-                parent=self.root,
-            )
+            self.configure_workbook_columns(source)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Upload failed", str(exc), parent=self.root)
             return
         listed_names = self.save_reviewers()
         if listed_names is None:
@@ -753,7 +842,7 @@ class Dashboard:
             "assigned_by_names": listed_names,
             "action_scope": "document",
         }
-        self.run_month = selected_month
+        self.run_month = "all_dates"
         self.running = True
         self.organization_warning = ""
         self.run_indicator.configure(text="Running", style="Running.TLabel")
@@ -762,7 +851,6 @@ class Dashboard:
         self.run_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.export_button.configure(state="disabled")
-        self.month_picker.configure(state="disabled")
         self.table.delete(*self.table.get_children())
         self.manager_items.clear()
         self.documents_data = []
@@ -804,8 +892,13 @@ class Dashboard:
                     on_organization_progress=lambda text: self.events.put(
                         ("organization_progress", text)
                     ),
-                    on_directory_unavailable=None if getattr(sys, "frozen", False) else self.request_directory_runtime,
+                    on_directory_unavailable=(
+                        None
+                        if getattr(sys, "frozen", False)
+                        else self.request_directory_runtime
+                    ),
                     cancel=cancel,
+                    all_dates=True,
                 )
                 status, groups, documents = read_results(output)
                 data = output.read_bytes()
@@ -846,11 +939,13 @@ class Dashboard:
                 selected = ""
                 if not self.cancel.is_set() and messagebox.askyesno(
                     "Organization lookup setup",
-                    reason + "\n\nChoose a Python installation with DataSyncX to retry?",
+                    reason
+                    + "\n\nChoose a Python installation with DataSyncX to retry?",
                     parent=self.root,
                 ):
                     selected = filedialog.askopenfilename(
-                        parent=self.root, title="Select Python with DataSyncX",
+                        parent=self.root,
+                        title="Select Python with DataSyncX",
                         filetypes=[("Python executable", "python.exe")],
                     )
                 answer.put(selected or None)
@@ -870,7 +965,6 @@ class Dashboard:
             self.run_indicator.configure(text="Stopped", style="Stopped.TLabel")
             self.run_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
-            self.month_picker.configure(state="normal")
             self.progress.stop()
             self.progress.grid_remove()
             if event == "complete":
@@ -883,11 +977,13 @@ class Dashboard:
                 )
                 if not counts.get("Qualified", 0):
                     self.status.set(
-                        f"No matching submissions for {self.run_month}. Check month and listed names. "
+                        "No matching submissions. Check listed names and filters. "
                         f"Unverified eligibility: {counts.get('Unverified', 0)}."
                     )
                 if self.organization_warning:
-                    self.status.set(self.status.get() + "; " + self.organization_warning)
+                    self.status.set(
+                        self.status.get() + "; " + self.organization_warning
+                    )
                 self.display_results(counts, groups)
                 self.documents_data = documents
                 self.render_documents()

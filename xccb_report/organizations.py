@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 import time
 
-from .rules import normalized
+from .filtering import normalized
 
 
 def user_directory():
@@ -127,7 +127,10 @@ class OrganizationCache:
                         or not entry.organization.strip()
                         or stamp.tzinfo is None
                         or entry.identity_confirmed not in {"yes", "no"}
-                        or (entry.matched_name and normalized(entry.matched_name) != entry.lookup_name)
+                        or (
+                            entry.matched_name
+                            and normalized(entry.matched_name) != entry.lookup_name
+                        )
                         or entry.lookup_name in entries
                     ):
                         raise ValueError("invalid or duplicate mapping")
@@ -161,7 +164,15 @@ class OrganizationCache:
             self.entries = entries
 
     def resolve(
-        self, names, query=None, *, batch_query=None, refresh=False, confirm=None, progress=None, cancel=None
+        self,
+        names,
+        query=None,
+        *,
+        batch_query=None,
+        refresh=False,
+        confirm=None,
+        progress=None,
+        cancel=None,
     ):
         results, issues = {}, {}
         unique = {}
@@ -187,22 +198,32 @@ class OrganizationCache:
                 rows_by_name, error = {}, ""
                 try:
                     if cancel and cancel.is_set():
-                        raise DirectoryUnavailable("Organization lookup stopped by user")
+                        raise DirectoryUnavailable(
+                            "Organization lookup stopped by user"
+                        )
                     if progress:
-                        progress(f"Organization lookup: {len(work)} exact names in one batch")
+                        progress(
+                            f"Organization lookup: {len(work)} exact names in one batch"
+                        )
                     rows_by_name = batch_query([name for _, _, name, _ in work])
                     if not isinstance(rows_by_name, dict):
                         raise ValueError("Invalid organization batch response")
                 except Exception as exc:
                     rows_by_name = {}
-                    error = (str(exc) if isinstance(exc, DirectoryUnavailable) else
-                             f"Directory unavailable ({type(exc).__name__}); check DataSyncX, Oracle client/TNS and network access")
+                    error = (
+                        str(exc)
+                        if isinstance(exc, DirectoryUnavailable)
+                        else f"Directory unavailable ({type(exc).__name__}); check DataSyncX, Oracle client/TNS and network access"
+                    )
                 for item in work:
                     yield item, rows_by_name.get(item[1], []), error
                 return
             remaining = iter(work)
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="xccb-org") as executor:
+            with ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="xccb-org"
+            ) as executor:
                 pending = {}
+
                 def submit_next():
                     nonlocal unavailable
                     if cancel and cancel.is_set():
@@ -213,8 +234,13 @@ class OrganizationCache:
                     if item is not None:
                         index, key, name, cached = item
                         if progress:
-                            progress(f"Organization lookup {index}/{len(unique)}: {name}")
-                        pending[executor.submit(query, name, cached.wwid if cached else "")] = item
+                            progress(
+                                f"Organization lookup {index}/{len(unique)}: {name}"
+                            )
+                        pending[
+                            executor.submit(query, name, cached.wwid if cached else "")
+                        ] = item
+
                 for _ in range(4):
                     submit_next()
                 while pending:
@@ -224,8 +250,11 @@ class OrganizationCache:
                     try:
                         rows = future.result()
                     except Exception as exc:
-                        error = (str(exc) if isinstance(exc, DirectoryUnavailable) else
-                                 f"Directory unavailable ({type(exc).__name__}); check DataSyncX Python, Oracle client/TNS and network access")
+                        error = (
+                            str(exc)
+                            if isinstance(exc, DirectoryUnavailable)
+                            else f"Directory unavailable ({type(exc).__name__}); check DataSyncX Python, Oracle client/TNS and network access"
+                        )
                         unavailable = error
                     yield item, rows, error
                     submit_next()
@@ -256,8 +285,16 @@ class OrganizationCache:
                     ):
                         raise ValueError("HR identity has conflicting organizations")
                     candidates[identity] = row
-                chosen = candidates.get(cached.wwid) if cached and batch_query is None else None
-                confirmed = cached.identity_confirmed if cached and batch_query is None else "no"
+                chosen = (
+                    candidates.get(cached.wwid)
+                    if cached and batch_query is None
+                    else None
+                )
+                confirmed = (
+                    cached.identity_confirmed
+                    if cached and batch_query is None
+                    else "no"
+                )
                 if len(candidates) == 1 and (batch_query is not None or not cached):
                     chosen = next(iter(candidates.values()))
                 if chosen is None:
@@ -296,7 +333,11 @@ class OrganizationCache:
                     if isinstance(exc, (DirectoryUnavailable, ValueError))
                     else f"Organization cache update failed ({type(exc).__name__}); check cache permissions"
                 )
-            if key not in results and cached and not issues.get(key, "").startswith("Identity unresolved:"):
+            if (
+                key not in results
+                and cached
+                and not issues.get(key, "").startswith("Identity unresolved:")
+            ):
                 results[key] = cached
                 issues[key] = (
                     issues.get(key, "Refresh unresolved")
@@ -312,10 +353,11 @@ def load_settings(path=None):
         return {"organization_codes": []}
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
-        codes = value["organization_codes"]
+        if not isinstance(value, dict):
+            raise ValueError("Settings must be an object")
+        codes = value.setdefault("organization_codes", [])
         if (
-            not isinstance(value, dict)
-            or not isinstance(codes, list)
+            not isinstance(codes, list)
             or any(not isinstance(code, str) or not code.strip() for code in codes)
         ):
             raise ValueError("organization_codes must be a list of nonblank strings")
@@ -376,7 +418,11 @@ def directory_query(python=None, on_unavailable=None, cancel=None):
                 if attempted != current:
                     retry = current
                 else:
-                    if setup_attempted or on_unavailable is None or (cancel and cancel.is_set()):
+                    if (
+                        setup_attempted
+                        or on_unavailable is None
+                        or (cancel and cancel.is_set())
+                    ):
                         raise
                     setup_attempted = True
                     chosen = on_unavailable(str(exc))
@@ -394,21 +440,27 @@ def directory_query(python=None, on_unavailable=None, cancel=None):
 def _run_directory(payload, python):
     if getattr(sys, "frozen", False):
         from tempfile import TemporaryDirectory
+
         with TemporaryDirectory(prefix="xccb_org_") as directory:
             request = Path(directory) / "request.json"
             response = Path(directory) / "response.json"
             request.write_text(json.dumps(payload), encoding="utf-8")
             completed = subprocess.run(
                 [sys.executable, "--organization-worker", str(request), str(response)],
-                capture_output=True, timeout=45,
+                capture_output=True,
+                timeout=45,
                 cwd=directory,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if not response.exists():
-                raise DirectoryUnavailable("Bundled DataSyncX worker failed to start; check the application build")
+                raise DirectoryUnavailable(
+                    "Bundled DataSyncX worker failed to start; check the application build"
+                )
             result = json.loads(response.read_text(encoding="utf-8"))
             if completed.returncode:
-                raise DirectoryUnavailable(result.get("error", "Bundled DataSyncX lookup failed"))
+                raise DirectoryUnavailable(
+                    result.get("error", "Bundled DataSyncX lookup failed")
+                )
             return result
     executable = python or sys.executable
     if not executable:

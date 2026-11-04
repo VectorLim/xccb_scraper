@@ -51,10 +51,10 @@ def document_row(
         for v in (
             result,
             document,
-            title,
             manager,
             organization,
             phase,
+            title,
             submitted,
             url,
             notes,
@@ -89,7 +89,7 @@ def read_results(path):
                 document_row(
                     checked[5],
                     checked[1],
-                    get("CCB Title"),
+                    get("Document") if "Document" in index else get("CCB Title"),
                     get("Author Manager"),
                     get("Phase"),
                     get("Document Submitted"),

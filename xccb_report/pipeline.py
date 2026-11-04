@@ -7,16 +7,16 @@ import logging
 from pathlib import Path
 
 from .actions import workspace_identity
-from .evidence import load_evidence
+from .evidence import load_document_title, load_evidence
 from .organizations import OrganizationCache, directory_query, load_settings
-from .rules import (
-    Eligibility,
+from .filtering import (
     PHASE_RULE,
     REVIEWER_RULE,
     classify,
     eligibility,
     month_bounds,
     normalized,
+    organization_eligibility,
 )
 from .workbook import ReportWriter, read_source
 
@@ -48,6 +48,7 @@ def report(
     on_organization_progress=None,
     on_directory_unavailable=None,
     cancel=None,
+    all_dates=False,
 ):
     source, output = Path(source).resolve(), Path(output).resolve()
     if source == output or output.exists():
@@ -56,7 +57,7 @@ def report(
         )
     fixed_time = now is not None
     now = now or datetime.now(timezone.utc)
-    start, end = month_bounds(now, config["timezone"], reporting_month)
+    start, end = (None, None) if all_dates else month_bounds(now, config["timezone"], reporting_month)
     settings = load_settings()
     cache = (
         organization_cache if organization_cache is not None else OrganizationCache()
@@ -71,14 +72,23 @@ def report(
         url_column = headers.index("Document WS URL")
         source_rows = list(sheet.iter_rows(min_row=4))
         decisions = {
-            cells[0].row: eligibility(dict(zip(headers, [cell.value for cell in cells])), config, book.epoch, now, reporting_month)
-            for cells in source_rows if any(cell.value is not None for cell in cells)
+            cells[0].row: eligibility(
+                dict(zip(headers, [cell.value for cell in cells])),
+                config,
+                book.epoch,
+                now,
+                reporting_month,
+                **({"all_dates": True} if all_dates else {}),
+            )
+            for cells in source_rows
+            if any(cell.value is not None for cell in cells)
         }
         organizations, organization_issues = cache.resolve(
             [
                 cells[manager_index].value
                 for cells in source_rows
-                if cells[0].row in decisions and decisions[cells[0].row].status == "Qualified"
+                if cells[0].row in decisions
+                and decisions[cells[0].row].status == "Qualified"
             ],
             organization_query,
             batch_query=None if organization_query is not None else batch_query,
@@ -87,7 +97,10 @@ def report(
             cancel=cancel,
         )
         if organization_issues and on_organization_progress:
-            on_organization_progress("Organization lookup warning: " + next(iter(organization_issues.values())))
+            on_organization_progress(
+                "Organization lookup warning: "
+                + next(iter(organization_issues.values()))
+            )
 
         writer = ReportWriter(sheet, book.epoch)
         counts, groups, group_labels = Counter(), {}, {}
@@ -107,16 +120,7 @@ def report(
             row = dict(zip(headers, [c.value for c in cells]))
             decision = decisions[cells[0].row]
             organization = organizations.get(normalized(row.get("Author Manager")))
-            if codes and decision.status != "Excluded":
-                if organization is None:
-                    decision = Eligibility(
-                        "Unverified",
-                        decision.reasons + ("Organization selection: identity unresolved",),
-                    )
-                elif organization.organization_code not in codes:
-                    decision = Eligibility(
-                        "Excluded", decision.reasons + ("Organization code not selected",)
-                    )
+            decision = organization_eligibility(decision, organization, codes)
             ws_cell = cells[url_column]
             url = ws_cell.hyperlink.target if ws_cell.hyperlink else ""
             doc_id, canonical, link_error = "", "", ""
@@ -133,7 +137,17 @@ def report(
                     " ".join(str("" if manager is None else manager).split())
                     or "(Not specified)",
                 )
-            entry = (cells, row, decision, url, doc_id, canonical, link_error, target_row, audit_row)
+            entry = (
+                cells,
+                row,
+                decision,
+                url,
+                doc_id,
+                canonical,
+                link_error,
+                target_row,
+                audit_row,
+            )
             if decision.status == "Qualified" and not link_error:
                 pending.setdefault(doc_id, []).append(entry)
             else:
@@ -147,9 +161,12 @@ def report(
                 try:
                     capture(reader, canonical, evidence_dir)
                 except (OSError, ValueError) as exc:
-                    return [], False, f"Live capture failed: {exc}", ""
+                    return ([], False, f"Live capture failed: {exc}", ""), ""
             evidence_now = now if fixed_time else datetime.now(timezone.utc)
-            return load_evidence(evidence_dir, doc_id, config, evidence_now)
+            return (
+                load_evidence(evidence_dir, doc_id, config, evidence_now),
+                load_document_title(evidence_dir, doc_id, config, evidence_now),
+            )
 
         def completed_rows():
             with ThreadPoolExecutor(
@@ -167,8 +184,19 @@ def report(
                         yield entry, evidence
 
         for entry, evidence in completed_rows():
-            cells, row, decision, url, doc_id, canonical, link_error, target_row, audit_row = entry
+            (
+                cells,
+                row,
+                decision,
+                url,
+                doc_id,
+                canonical,
+                link_error,
+                target_row,
+                audit_row,
+            ) = entry
             value, matches, reference = "", [], ""
+            document_title = ""
             reasons = list(decision.reasons)
             check = "Not checked"
             progress_group = None
@@ -178,7 +206,8 @@ def report(
                 if link_error:
                     check = "Unverified"
                 else:
-                    actions, complete, evidence_reason, reference = evidence
+                    action_evidence, document_title = evidence
+                    actions, complete, evidence_reason, reference = action_evidence
                     value, matches, reason = classify(
                         actions,
                         config["assigned_by_names"],
@@ -187,7 +216,9 @@ def report(
                     )
                     check = "Verified" if value else "Unverified"
                     reasons.extend([reason, evidence_reason])
-                writer.add_submission(target_row, cells, value)
+                if not document_title:
+                    reasons.append("Document title unavailable from xCCB workspace")
+                writer.add_submission(target_row, cells, value, document_title)
                 counts[value or "Unresolved Actions"] += 1
                 group = groups.setdefault(key, Counter())
                 group["Qualified"] += 1
@@ -203,8 +234,14 @@ def report(
             counts[decision.status] += 1
             if link_error:
                 reasons.append(link_error)
-            organization_status = _organization_status(organization, organization_issues.get(key))
-            not_looked_up = organization is None and key not in organization_issues and decision.status != "Qualified"
+            organization_status = _organization_status(
+                organization, organization_issues.get(key)
+            )
+            not_looked_up = (
+                organization is None
+                and key not in organization_issues
+                and decision.status != "Qualified"
+            )
             if not_looked_up:
                 organization_status = "Not looked up: submission not eligible"
             values = [
@@ -217,25 +254,31 @@ def report(
                 "; ".join(matches),
                 "; ".join(dict.fromkeys(reasons)),
                 reference,
-                row["Phase"],
+                row.get("Phase"),
                 row.get("Version"),
-                row["Document Submitted"],
+                row.get("Document Submitted"),
                 row.get("Author Manager"),
-                organization.organization if organization else "" if not_looked_up else "Unresolved",
+                (
+                    organization.organization
+                    if organization
+                    else "" if not_looked_up else "Unresolved"
+                ),
                 organization.organization_code if organization else "",
                 organization.wwid if organization else "",
                 organization.looked_up_utc if organization else "",
                 organization_status,
             ]
             writer.add_audit(audit_row, values, canonical)
-            logging.debug("Source row %s: %s / %s", cells[0].row, decision.status, check)
+            logging.debug(
+                "Source row %s: %s / %s", cells[0].row, decision.status, check
+            )
             if on_progress is not None:
                 document = None
                 if decision.status == "Qualified":
                     document = {
                         "result": value,
                         "document": doc_id,
-                        "title": row.get("CCB Title"),
+                        "title": document_title,
                         "manager": row.get("Author Manager"),
                         "phase": row.get("Phase"),
                         "organization": (
@@ -280,8 +323,8 @@ def report(
                     ),
                 ],
                 ["Business timezone", config["timezone"]],
-                ["Month start inclusive", str(start)],
-                ["Next month exclusive", str(end)],
+                ["Month start inclusive", str(start) if start else "All dates"],
+                ["Next month exclusive", str(end) if end else "All dates"],
                 ["Generated UTC", now.isoformat()],
                 ["Source workbook", str(source)],
                 ["Yes", counts["Yes"]],
@@ -295,13 +338,19 @@ def report(
                 ["Reviewer rule", REVIEWER_RULE],
                 ["Allowed reviewer names", "; ".join(config.get("reviewer_names", []))],
                 ["Grouping", "Author Manager; blank values retained"],
-                ["Selected organization codes", "; ".join(codes) or "All organizations"],
+                [
+                    "Selected organization codes",
+                    "; ".join(codes) or "All organizations",
+                ],
                 [
                     "Organization basis",
                     "Current active HR name candidates, not historical membership; no inferred KuAT hierarchy",
                 ],
                 ["Organization lookup issues", len(organization_issues)],
-                ["Assigned by list configured", "Yes" if config["assigned_by_names"] else "No"],
+                [
+                    "Assigned by list configured",
+                    "Yes" if config["assigned_by_names"] else "No",
+                ],
             ]
         )
         writer.finish(manager_index, organizations)

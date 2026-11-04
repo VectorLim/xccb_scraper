@@ -90,6 +90,12 @@ def sanitized(node):
 def capture(reader, url, directory):
     doc_id, canonical = workspace_identity(url)
     workspace = BeautifulSoup(reader.get(canonical), "html.parser")
+    titles = {
+        " ".join(link.get_text(" ", strip=True).split())
+        for link in workspace.select('[id$="_DocumentTitleCell"] a[onclick*="ViewOnlineDocument("]')
+        if link.get_text(strip=True)
+    }
+    document_title = next(iter(titles)) if len(titles) == 1 else ""
     frames = workspace.find_all("iframe", id="iFrameActions")
     if len(frames) != 1:
         page = " ".join(workspace.get_text(" ").split())
@@ -106,7 +112,9 @@ def capture(reader, url, directory):
         raise ValueError("Unexpected Actions iframe route or document identity")
     # Complete HTTP response body is received before parsing; no browser timing heuristic.
     frame = BeautifulSoup(reader.get(frame_url), "html.parser")
-    clean = sanitized(frame.body or frame)
+    title_node = workspace.new_tag("div", id="xccb-document-title")
+    title_node.string = document_title
+    clean = str(title_node) + sanitized(frame.body or frame)
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     source = directory / f"{doc_id}.html"
