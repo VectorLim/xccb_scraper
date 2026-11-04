@@ -2,8 +2,9 @@ import argparse
 import json
 import logging
 
+from .config import load_config
+from .pipeline import report
 from .site import WindowsReader
-from .workbook import load_config, report
 
 
 def main():

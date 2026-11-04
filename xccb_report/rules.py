@@ -15,7 +15,8 @@ def normalized(value):
 
 
 def exact_name(value, names):
-    return bool(normalized(value)) and normalized(value) in {normalized(n) for n in names}
+    value = normalized(value)
+    return bool(value) and value in {normalized(n) for n in names}
 
 
 def reviewer_match(value, names):
