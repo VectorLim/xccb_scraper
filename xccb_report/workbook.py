@@ -45,6 +45,11 @@ MANAGER_HEADERS = [
 ]
 
 
+def activity_header(headers):
+    names = {normalized(header): header for header in headers}
+    return names.get("activity") or names.get("activity status")
+
+
 def read_source(path):
     workbook = load_workbook(path)
     sheets = [s for s in workbook if REQUIRED <= {c.value for c in s[3]}]
@@ -82,12 +87,20 @@ class ReportWriter:
             None,
         )
         self.columns = [
-            (cell.column, cell.value) for cell in sheet[3]
+            (cell.column, cell.value)
+            for cell in sheet[3]
             if cell.column != title_column
         ]
         phase = next(
             (index for index, (_, name) in enumerate(self.columns) if name == "Phase"),
-            next((index - 1 for index, (_, name) in enumerate(self.columns) if name == "Document Submitted"), len(self.columns) - 1),
+            next(
+                (
+                    index - 1
+                    for index, (_, name) in enumerate(self.columns)
+                    if name == "Document Submitted"
+                ),
+                len(self.columns) - 1,
+            ),
         )
         self.columns.insert(phase + 1, (title_column, "Document"))
         for column, (source_column, name) in enumerate(self.columns, 1):
@@ -97,7 +110,9 @@ class ReportWriter:
             target.alignment = Alignment(wrap_text=True, vertical="top")
         result_column = len(self.columns) + 1
         self.results.cell(1, result_column, "Flawless submission")
-        self.results.cell(1, result_column)._style = copy(self.results.cell(1, result_column - 1)._style)
+        self.results.cell(1, result_column)._style = copy(
+            self.results.cell(1, result_column - 1)._style
+        )
         self.results.row_dimensions[1].height = 75
         self.results.freeze_panes = "A2"
         self.audit.append(AUDIT_HEADERS)
@@ -175,7 +190,8 @@ class ReportWriter:
             self.managers.column_dimensions[column].width = 24
         results = self.results
         organization_column = next(
-            column + 1 for column, (source_column, _) in enumerate(self.columns, 1)
+            column + 1
+            for column, (source_column, _) in enumerate(self.columns, 1)
             if source_column == manager_index + 1
         )
         results.insert_cols(organization_column)
@@ -191,7 +207,13 @@ class ReportWriter:
             if target_index is None:
                 continue
             target = results.column_dimensions[get_column_letter(target_index)]
-            for attribute in ("width", "hidden", "bestFit", "outlineLevel", "collapsed"):
+            for attribute in (
+                "width",
+                "hidden",
+                "bestFit",
+                "outlineLevel",
+                "collapsed",
+            ):
                 setattr(target, attribute, getattr(dimension, attribute))
             target.min = (
                 column_positions.get(dimension.min, target_index)
@@ -223,7 +245,9 @@ class ReportWriter:
             for cell in row_cells:
                 if cell.hyperlink:
                     cell.hyperlink.ref = cell.coordinate
-        document_column = next(cell.column for cell in results[1] if cell.value == "Document")
+        document_column = next(
+            cell.column for cell in results[1] if cell.value == "Document"
+        )
         results.column_dimensions[get_column_letter(document_column)].width = 60
         last_column = get_column_letter(results.max_column)
         results.column_dimensions[last_column].width = 24

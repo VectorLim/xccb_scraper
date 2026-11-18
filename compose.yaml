@@ -1,0 +1,36 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "127.0.0.1:${XCCB_WEB_PORT:-8080}:8080"
+    tmpfs:
+      - /tmp:mode=1777,size=768m
+    environment:
+      XCCB_ENABLE_REPORTS: "${XCCB_ENABLE_REPORTS:-0}"
+      XCCB_WORKER_SECRET_FILE: /run/secrets/xccb_worker
+      XCCB_REPORT_CONFIG: /run/xccb/config.json
+      XCCB_MAX_UPLOAD_MIB: "${XCCB_MAX_UPLOAD_MIB:-25}"
+      XCCB_MAX_REPORT_MIB: "${XCCB_MAX_REPORT_MIB:-50}"
+      XCCB_MAX_EXPANDED_MIB: "${XCCB_MAX_EXPANDED_MIB:-250}"
+      XCCB_MAX_JOBS: "${XCCB_MAX_JOBS:-12}"
+      XCCB_JOB_TIMEOUT_SECONDS: "${XCCB_JOB_TIMEOUT_SECONDS:-3600}"
+    volumes:
+      - type: bind
+        source: ${XCCB_REPORT_CONFIG_FILE:-./config.example.json}
+        target: /run/xccb/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - xccb_worker
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+secrets:
+  xccb_worker:
+    file: ${XCCB_WORKER_SECRET_HOST_FILE:-./.xccb-worker-token}

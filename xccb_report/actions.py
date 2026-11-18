@@ -34,7 +34,7 @@ def text(node):
 
 
 def parse_actions(html, document_id, empty_state_text=""):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "html.parser")
     tables = soup.find_all("table", class_="action-panel")
     errors, actions, seen = [], [], set()
     empty_verified = bool(empty_state_text.strip()) and any(

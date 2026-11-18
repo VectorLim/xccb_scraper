@@ -1,6 +1,7 @@
 .venv/
 .venv-build/
 .env
+.xccb-worker-token
 __pycache__/
 .pytest_cache/
 outputs/

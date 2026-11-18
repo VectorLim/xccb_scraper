@@ -29,7 +29,11 @@ def test_one_matching_assigned_by_among_multiple_actions_classifies_no():
         complete=True,
         scope="document",
     )
-    assert result == ("No", ["  DOE,\t Jane ", "Doe, Jane"], "Matching Assigned by identity found")
+    assert result == (
+        "No",
+        ["  DOE,\t Jane ", "Doe, Jane"],
+        "Matching Assigned by identity found",
+    )
 
 
 def test_incomplete_nonmatch_and_unconfirmed_scope_remain_blank():
@@ -41,13 +45,20 @@ def test_complete_document_scope_with_zero_actions_classifies_yes():
     assert classify([], ["Doe, Jane"], complete=True, scope="document")[0] == "Yes"
 
 
-@pytest.mark.parametrize("reviewers,expected", [(None, "Qualified"), (" \t\n", "Qualified"),
-                                               (0, "Excluded"), (False, "Excluded"),
-                                               ("Any Other Person", "Excluded"),
-                                               ("Doe, Jane; Smith, Alex", "Qualified"),
-                                               ("Smith, Alex\n DOE,  Jane ", "Qualified"),
-                                               ("Doe, Jane Jr.", "Qualified"),
-                                               ("Reviewer: Doe, Jane (Admin)", "Qualified")])
+@pytest.mark.parametrize(
+    "reviewers,expected",
+    [
+        (None, "Qualified"),
+        (" \t\n", "Qualified"),
+        (0, "Excluded"),
+        (False, "Excluded"),
+        ("Any Other Person", "Excluded"),
+        ("Doe, Jane; Smith, Alex", "Qualified"),
+        ("Smith, Alex\n DOE,  Jane ", "Qualified"),
+        ("Doe, Jane Jr.", "Qualified"),
+        ("Reviewer: Doe, Jane (Admin)", "Qualified"),
+    ],
+)
 def test_reviewer_is_blank_or_contains_a_listed_name(reviewers, expected):
     row, config, epoch, now = _eligibility_inputs()
     row["Reviewer(s)"] = reviewers
@@ -67,7 +78,9 @@ def test_reporting_month_and_submitted_dates_use_malaysia_midnight_boundaries():
         date(2026, 2, 1),
         date(2026, 3, 1),
     )
-    assert submitted_date(malaysia_midnight, WINDOWS_EPOCH, "Asia/Kuala_Lumpur") == date(2026, 2, 1)
+    assert submitted_date(
+        malaysia_midnight, WINDOWS_EPOCH, "Asia/Kuala_Lumpur"
+    ) == date(2026, 2, 1)
     assert submitted_date(
         datetime(2026, 1, 31, 15, 59, tzinfo=timezone.utc),
         WINDOWS_EPOCH,
@@ -92,8 +105,18 @@ def _eligibility_inputs(phase="Final", author_manager="Alice Manager", submitted
     return row, config, WINDOWS_EPOCH, now
 
 
-@pytest.mark.parametrize("phase", [" \tFINAL\n ", "Preliminary", "Final Approval", "Do Not Implement",
-                                  "ATM Class III-N", "", None])
+@pytest.mark.parametrize(
+    "phase",
+    [
+        " \tFINAL\n ",
+        "Preliminary",
+        "Final Approval",
+        "Do Not Implement",
+        "ATM Class III-N",
+        "",
+        None,
+    ],
+)
 def test_any_phase_without_excluded_text_qualifies(phase):
     row, config, epoch, now = _eligibility_inputs(phase=phase)
     assert eligibility(row, config, epoch, now).status == "Qualified"
@@ -105,19 +128,29 @@ def test_author_manager_does_not_filter_eligibility(manager):
     assert eligibility(row, config, epoch, now).status == "Qualified"
 
 
-@pytest.mark.parametrize("phase", ["WLA CCB Final", "WLA CCB Preliminary and PrePilot", " wLa ", "Final WLA"])
+@pytest.mark.parametrize(
+    "phase", ["WLA CCB Final", "WLA CCB Preliminary and PrePilot", " wLa ", "Final WLA"]
+)
 def test_any_phase_containing_wla_is_excluded(phase):
     row, config, epoch, now = _eligibility_inputs(phase=phase)
     assert eligibility(row, config, epoch, now).status == "Excluded"
-    assert any(reason.startswith("Phase contains WLA:") for reason in eligibility(row, config, epoch, now).reasons)
+    assert any(
+        reason.startswith("Phase contains WLA:")
+        for reason in eligibility(row, config, epoch, now).reasons
+    )
 
 
-@pytest.mark.parametrize("phase", ["LSI Modification", " lSi\tMODIFICATION ", "Final - LSI modification"])
+@pytest.mark.parametrize(
+    "phase", ["LSI Modification", " lSi\tMODIFICATION ", "Final - LSI modification"]
+)
 def test_any_phase_containing_lsi_modification_is_excluded(phase):
     row, config, epoch, now = _eligibility_inputs(phase=phase)
     result = eligibility(row, config, epoch, now)
     assert result.status == "Excluded"
-    assert any(reason.startswith("Phase contains LSI modification:") for reason in result.reasons)
+    assert any(
+        reason.startswith("Phase contains LSI modification:")
+        for reason in result.reasons
+    )
 
 
 @pytest.mark.parametrize("fyi", ["Yes", "No", "", None, True])
@@ -159,7 +192,11 @@ def test_workspace_identity_accepts_document_workspace_and_rejects_malformed_or_
 
 
 def _action_row(action_id="7", document_id="123", assigned_by="Doe, Jane"):
-    assigner = f"<span>Assigned By: {assigned_by}</span>" if assigned_by is not None else "<span>Jane Doe</span>"
+    assigner = (
+        f"<span>Assigned By: {assigned_by}</span>"
+        if assigned_by is not None
+        else "<span>Jane Doe</span>"
+    )
     return (
         "<tr><td><a href='/Actions/CompleteDocumentAction.aspx?ActionID="
         f"{action_id}&amp;DocumentID={document_id}'>Open</a></td>"
@@ -176,13 +213,16 @@ def test_parser_uses_assigned_by_label_not_adjacent_assignee():
 
 def test_parser_reports_pagination_and_malformed_missing_assigner():
     paginated = (
-        "<table class='action-panel'>" + _action_row()
+        "<table class='action-panel'>"
+        + _action_row()
         + "</table><a href='Document.aspx?Page$Next=2'>Next</a>"
     )
     _, errors = parse_actions(paginated, "123")
     assert any("pagination or incomplete listing" in error for error in errors)
 
-    malformed = "<table class='action-panel'>" + _action_row(assigned_by=None) + "</table>"
+    malformed = (
+        "<table class='action-panel'>" + _action_row(assigned_by=None) + "</table>"
+    )
     actions, errors = parse_actions(malformed, "123")
     assert actions == []
     assert any("Malformed action identity" in error for error in errors)
@@ -191,4 +231,6 @@ def test_parser_reports_pagination_and_malformed_missing_assigner():
 def test_parser_reports_absent_action_panel_table():
     actions, errors = parse_actions("<div>No action table</div>", "123")
     assert actions == []
-    assert errors == ["Expected exactly one action-panel table; unloaded/empty layout is not verified"]
+    assert errors == [
+        "Expected exactly one action-panel table; unloaded/empty layout is not verified"
+    ]

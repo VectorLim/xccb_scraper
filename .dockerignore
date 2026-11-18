@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!requirements.txt
+!requirements-web.txt
+!xccb_report/
+!xccb_report/**
+**/__pycache__/

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import json
 import logging
+import math
 from pathlib import Path
 
 from .reviewers import load_names
@@ -15,6 +16,11 @@ DEFAULTS = {
     "reviewer_names": [],
     "action_scope": "unconfirmed",
     "evidence_max_age_hours": 24,
+    "http_transport": "session",
+    "request_interval_seconds": 1.0,
+    "document_workers": 4,
+    "reuse_evidence": False,
+    "live_cache_minutes": 15,
 }
 LEGACY_FILTER_KEYS = {
     "reviewer_separator",
@@ -59,7 +65,24 @@ def save_preferences(updates):
         atomic_write(path, lambda stream: json.dump(settings, stream, indent=2))
 
 
-def load_config(path):
+def validate_performance(config):
+    values = DEFAULTS | config
+    if values["http_transport"] not in {"session", "powershell"}:
+        raise ValueError("http_transport must be session or powershell")
+    if type(values["document_workers"]) is not int or not 1 <= values["document_workers"] <= 16:
+        raise ValueError("document_workers must be an integer from 1 to 16")
+    if type(values["reuse_evidence"]) is not bool:
+        raise ValueError("reuse_evidence must be true or false")
+    for key, lower, upper in (
+        ("request_interval_seconds", 0.1, 60),
+        ("live_cache_minutes", 1, 1440),
+    ):
+        value = values[key]
+        if type(value) not in {int, float} or not math.isfinite(value) or not lower <= value <= upper:
+            raise ValueError(f"{key} must be a finite number from {lower} to {upper}")
+
+
+def load_config(path, *, use_preferences=True):
     supplied = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if (
         not isinstance(supplied, dict)
@@ -70,6 +93,7 @@ def load_config(path):
         supplied.pop(key)
         logging.warning("Ignoring obsolete filter setting: %s", key)
     config = DEFAULTS | supplied
+    validate_performance(config)
     for key in ("assigned_by_names", "reviewer_names"):
         if not isinstance(config[key], list) or any(
             not isinstance(v, str) or not normalized(v) for v in config[key]
@@ -85,7 +109,11 @@ def load_config(path):
     ):
         raise ValueError("Evidence age must be positive")
     month_bounds(datetime.now(timezone.utc), config["timezone"])
+    if not use_preferences:
+        return config
     preferences = load_preferences(Path(path).resolve().parent / "reviewer_names.txt")
     if "reviewer_names" in preferences:
-        config["reviewer_names"] = config["assigned_by_names"] = preferences["reviewer_names"]
+        config["reviewer_names"] = config["assigned_by_names"] = preferences[
+            "reviewer_names"
+        ]
     return config

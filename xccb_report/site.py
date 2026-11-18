@@ -1,21 +1,25 @@
 """Windows-integrated, GET-only access to the observed xCCB HTML pages."""
+
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import ssl
 import subprocess
-from threading import Lock
+from threading import Lock, local
 import time
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Comment
+import requests
+from requests.adapters import HTTPAdapter
 
 from .actions import workspace_identity
 from .evidence import inspect_saved, write_json
 
-
-PS_GET = r'''
+PS_GET = r"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -27,14 +31,59 @@ try {
   if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
   @{status=$status; url=$env:XCCB_READ_URL; html=''} | ConvertTo-Json -Compress
 }
-'''
+"""
+
+
+class WindowsTrustAdapter(HTTPAdapter):
+    def __init__(self):
+        self.context = ssl.create_default_context()
+        super().__init__(max_retries=0)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host, options = super().build_connection_pool_key_attributes(request, verify, cert)
+        options["ssl_context"] = self.context
+        return host, options
 
 
 class WindowsReader:
-    def __init__(self, interval=1.0, attempts=2, cancel=None):
-        self.interval, self.attempts, self.last = max(1.0, interval), attempts, 0.0
+    def __init__(self, interval=1.0, attempts=2, cancel=None, transport="session"):
+        if transport not in {"session", "powershell"}:
+            raise ValueError("Unknown HTTP transport")
+        self.interval, self.attempts, self.last = max(0.1, interval), attempts, 0.0
         self.lock = Lock()
         self.cancel = cancel
+        self.transport = transport
+        self.local = local()
+        self.sessions = []
+        self.metrics = {"requests": 0, "throttle_seconds": 0.0, "http_seconds": 0.0}
+
+    def close(self):
+        for session in self.sessions:
+            session.close()
+        self.sessions.clear()
+        self.local = local()
+
+    def _request(self, url):
+        if self.transport == "powershell":
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", PS_GET],
+                env=dict(os.environ, XCCB_READ_URL=url), capture_output=True,
+                timeout=35, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                raise OSError("Windows HTTP reader failed")
+            return json.loads(result.stdout.lstrip("\ufeff"))
+        if not hasattr(self.local, "session"):
+            from requests_negotiate_sspi import HttpNegotiateAuth
+
+            session = requests.Session()
+            session.auth = HttpNegotiateAuth()
+            session.mount("https://", WindowsTrustAdapter())
+            self.local.session = session
+            with self.lock:
+                self.sessions.append(session)
+        with self.local.session.get(url, allow_redirects=False, timeout=(10, 25)) as response:
+            return {"status": response.status_code, "url": response.url, "html": response.text}
 
     def check_cancel(self):
         if self.cancel is not None and self.cancel.is_set():
@@ -48,21 +97,24 @@ class WindowsReader:
             raise ValueError("Only the approved HTTPS xCCB host is permitted")
         for attempt in range(self.attempts):
             self.check_cancel()
+            waiting = time.monotonic()
             with self.lock:
                 time.sleep(max(0, self.interval - (time.monotonic() - self.last)))
                 self.last = time.monotonic()
+                self.metrics["throttle_seconds"] += self.last - waiting
+                self.metrics["requests"] += 1
             self.check_cancel()
-            env = dict(os.environ, XCCB_READ_URL=url)
+            started = time.monotonic()
             try:
-                result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", PS_GET],
-                                        env=env, capture_output=True, timeout=35, encoding="utf-8",
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-                if result.returncode:
-                    raise OSError("Windows HTTP reader failed")
-                response = json.loads(result.stdout.lstrip("\ufeff"))
+                response = self._request(url)
                 status = response["status"]
-            except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, requests.RequestException):
                 status = 0
+            finally:
+                elapsed = time.monotonic() - started
+                with self.lock:
+                    self.metrics["http_seconds"] += elapsed
+                logging.debug("xCCB request attempt %s: %.3fs", attempt + 1, elapsed)
             if status == 200:
                 final = urlparse(response["url"])
                 if final.scheme != "https" or final.netloc != "xccb2.intel.com":
@@ -72,7 +124,7 @@ class WindowsReader:
                 raise OSError(f"Windows authentication/access failed (HTTP {status})")
             if status not in {0, 429, 502, 503, 504} or attempt == self.attempts - 1:
                 raise OSError(f"xCCB GET failed (HTTP {status})")
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
 
 
 def sanitized(node):
@@ -83,7 +135,11 @@ def sanitized(node):
     for form in node.find_all("form"):
         form.unwrap()
     for tag in [node, *node.find_all(True)]:
-        tag.attrs = {k: v for k, v in tag.attrs.items() if k in {"id", "class", "href", "title", "rowspan", "colspan"}}
+        tag.attrs = {
+            k: v
+            for k, v in tag.attrs.items()
+            if k in {"id", "class", "href", "title", "rowspan", "colspan"}
+        }
     return str(node)
 
 
@@ -92,7 +148,9 @@ def capture(reader, url, directory):
     workspace = BeautifulSoup(reader.get(canonical), "html.parser")
     titles = {
         " ".join(link.get_text(" ", strip=True).split())
-        for link in workspace.select('[id$="_DocumentTitleCell"] a[onclick*="ViewOnlineDocument("]')
+        for link in workspace.select(
+            '[id$="_DocumentTitleCell"] a[onclick*="ViewOnlineDocument("]'
+        )
         if link.get_text(strip=True)
     }
     document_title = next(iter(titles)) if len(titles) == 1 else ""
@@ -101,14 +159,24 @@ def capture(reader, url, directory):
         page = " ".join(workspace.get_text(" ").split())
         if "Document not found" in page:
             deleted = re.search(r"deleted by .+? on [0-9/]+ [0-9:]+ [AP]M", page)
-            raise ValueError(f"Document deleted on xCCB ({deleted.group(0)})" if deleted else "Document not found on xCCB")
-        raise ValueError("Workspace Actions iframe missing; possible authentication or loading failure")
+            raise ValueError(
+                f"Document deleted on xCCB ({deleted.group(0)})"
+                if deleted
+                else "Document not found on xCCB"
+            )
+        raise ValueError(
+            "Workspace Actions iframe missing; possible authentication or loading failure"
+        )
     frame_url = urljoin(canonical, frames[0].attrs.get("src", ""))
     parsed = urlparse(frame_url)
     query = parse_qs(parsed.query)
-    if (parsed.scheme != "https" or parsed.netloc != "xccb2.intel.com"
-            or parsed.path.casefold() != "/documents/documentcomponents.aspx"
-            or query.get("Component") != ["Actions"] or query.get("DocumentID") != [doc_id]):
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "xccb2.intel.com"
+        or parsed.path.casefold() != "/documents/documentcomponents.aspx"
+        or query.get("Component") != ["Actions"]
+        or query.get("DocumentID") != [doc_id]
+    ):
         raise ValueError("Unexpected Actions iframe route or document identity")
     # Complete HTTP response body is received before parsing; no browser timing heuristic.
     frame = BeautifulSoup(reader.get(frame_url), "html.parser")
@@ -121,8 +189,14 @@ def capture(reader, url, directory):
     source.write_text(clean, encoding="utf-8")
     result = inspect_saved(source, canonical)
     # A full live GET of the document's own Actions iframe is the whole-document listing.
-    result |= {"frame_url": frame_url, "captured_at": datetime.now(timezone.utc).isoformat(), "kind": "live-html-get",
-               "scope": "document", "complete": not result["parse_errors"],
-               "validated_by": "Live xCCB capture", "validation_notes": f"GET {frame_url}"}
+    result |= {
+        "frame_url": frame_url,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "kind": "live-html-get",
+        "scope": "document",
+        "complete": not result["parse_errors"],
+        "validated_by": "Live xCCB capture",
+        "validation_notes": f"GET {frame_url}",
+    }
     write_json(directory / f"{doc_id}.json", result)
     return result

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>xCCB Flawless Submission Report</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='report.css') }}">
+  <script src="{{ url_for('static', filename='report.js') }}" defer></script>
+</head>
+<body>
+  <main>
+    <header class="heading">
+      <h1>xCCB Flawless Submission Report</h1>
+      <p id="availability" role="status">Checking worker availability…</p>
+    </header>
+    <form id="report-form" class="panel">
+      <div>
+        <label for="workbook">Forum Reviewers workbook</label>
+        <input id="workbook" name="workbook" type="file" accept=".xlsx" required>
+      </div>
+      <div>
+        <label for="names">Listed names, one per line</label>
+        <textarea id="names" name="names" rows="4">{{ defaults | join('\n') }}</textarea>
+      </div>
+      <button id="process" type="submit" disabled>Process workbook</button>
+      <p id="job-status" role="status"></p>
+    </form>
+    <section id="results" hidden>
+      <header class="heading">
+        <div>
+          <h2>Report results</h2>
+          <p id="quality"></p>
+        </div>
+        <a id="excel" class="button">Download Excel</a>
+      </header>
+      <details class="panel" open>
+        <summary>Submissions</summary>
+        <div class="filters">
+          <div><label for="search">Search submissions</label><input type="search" id="search"></div>
+          <div>
+            <label for="date-mode">Submitted by</label>
+            <select id="date-mode">
+              <option value="month">Month</option>
+              <option value="day">Day</option>
+            </select>
+          </div>
+          <div><label for="date">Submitted date</label><select id="date"></select></div>
+          <div>
+            <label for="result-filter">Flawless</label>
+            <select id="result-filter">
+              <option value="all">All results</option>
+              <option value="Yes">Yes</option>
+              <option value="No">No</option>
+              <option value="">Unresolved</option>
+            </select>
+          </div>
+        </div>
+        <p id="visible-count" role="status"></p>
+        <div class="scroll" tabindex="0" role="region" aria-label="Submissions">
+          <table id="documents"></table>
+        </div>
+      </details>
+      <details class="panel" open>
+        <summary>By Author Manager</summary>
+        <div class="scroll" tabindex="0" role="region" aria-label="By Author Manager">
+          <table id="managers"></table>
+        </div>
+      </details>
+    </section>
+  </main>
+</body>
+</html>

@@ -12,6 +12,9 @@ if (-not (Test-Path -LiteralPath $Python)) {
 if ($LASTEXITCODE -ne 0) { throw 'Build prerequisites are not satisfied' }
 $hrHelper = & $Python -c "import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec('datasyncx').origin).parent / 'utils' / 'get_user_email.py')"
 if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the DataSyncX HR helper' }
-& $Python -m PyInstaller --noconfirm --clean --log-level WARN --onefile --windowed --name xCCB_Report --distpath $DistPath --collect-all tzdata --collect-data datasyncx --copy-metadata datasyncx --collect-submodules oracledb --add-data "${hrHelper};datasyncx\utils" dashboard.py
+& $Python -m PyInstaller --noconfirm --clean --log-level WARN --onefile --windowed --name xCCB_Report --distpath $DistPath --hidden-import win32timezone --collect-all tzdata --collect-data datasyncx --copy-metadata datasyncx --collect-submodules oracledb --add-data "${hrHelper};datasyncx\utils" dashboard.py
 if ($LASTEXITCODE -ne 0) { throw 'Executable build failed' }
-Write-Output ("Built " + (Join-Path $DistPath 'xCCB_Report.exe'))
+$executable = Join-Path $DistPath 'xCCB_Report.exe'
+& $Python -c "import sys; from PyInstaller.archive.readers import CArchiveReader; archive = CArchiveReader(sys.argv[1]); pyz = archive.open_embedded_archive(next(name for name in archive.toc if name.endswith('.pyz'))); assert 'win32timezone' in pyz.toc, 'Missing frozen Windows authentication dependency: win32timezone'" $executable
+if ($LASTEXITCODE -ne 0) { throw 'Packaged Windows authentication dependency check failed' }
+Write-Output ("Built " + $executable)

@@ -1,4 +1,5 @@
 """Editable reviewer-list persistence, shared by the CLI and dashboard."""
+
 from pathlib import Path
 
 from .filtering import normalized

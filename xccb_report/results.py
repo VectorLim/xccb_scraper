@@ -4,6 +4,22 @@ from datetime import date, datetime
 
 from openpyxl import load_workbook
 
+from .workbook import activity_header
+
+DOCUMENT_FIELDS = (
+    ("result", "Flawless"),
+    ("document", "Document ID"),
+    ("manager", "Author Manager"),
+    ("organization", "Organization"),
+    ("phase", "Phase"),
+    ("title", "Document"),
+    ("submitted", "Submitted"),
+    ("activity", "Activity"),
+    ("reviewers", "Reviewer(s)"),
+    ("url", "Document WS URL"),
+    ("notes", "Notes"),
+)
+
 SHORT_NOTES = (
     ("Live capture failed: Stopped by user", "Stopped"),
     ("Live capture failed: Document deleted", "Document deleted on xCCB"),
@@ -39,6 +55,8 @@ def document_row(
     matches,
     reasons,
     organization="Unresolved",
+    activity=None,
+    reviewers=None,
 ):
     if isinstance(submitted, (date, datetime)):
         submitted = submitted.strftime("%Y-%m-%d")
@@ -47,8 +65,8 @@ def document_row(
         f"Assigned by: {matches}" if result == "No" and matches else short_note(reasons)
     )
     return tuple(
-        "" if v is None else " ".join(str(v).split())
-        for v in (
+        "" if v is None else str(v) if index == 4 else " ".join(str(v).split())
+        for index, v in enumerate((
             result,
             document,
             manager,
@@ -56,9 +74,11 @@ def document_row(
             phase,
             title,
             submitted,
+            activity,
+            reviewers,
             url,
             notes,
-        )
+        ))
     )
 
 
@@ -76,6 +96,7 @@ def read_results(path):
         ]
         sheet = book["Flawless submissions"]
         index = {cell.value: position for position, cell in enumerate(sheet[1])}
+        activity_column = activity_header(index)
         documents = []
         for cells, checked in zip(sheet.iter_rows(min_row=2), audit):
             get = lambda name: cells[index[name]].value if name in index else None
@@ -97,6 +118,8 @@ def read_results(path):
                     checked[6],
                     checked[7],
                     get("Organization"),
+                    get(activity_column),
+                    get("Reviewer(s)"),
                 )
             )
         return status, groups, documents

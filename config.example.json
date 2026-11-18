@@ -3,5 +3,10 @@
   "assigned_by_names": [],
   "reviewer_names": [],
   "action_scope": "unconfirmed",
-  "evidence_max_age_hours": 24
+  "evidence_max_age_hours": 24,
+  "http_transport": "session",
+  "request_interval_seconds": 1.0,
+  "document_workers": 4,
+  "reuse_evidence": false,
+  "live_cache_minutes": 15
 }

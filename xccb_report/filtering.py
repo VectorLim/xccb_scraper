@@ -7,8 +7,12 @@ import re
 
 from openpyxl.utils.datetime import from_excel
 
-PHASE_RULE = "All phases except values containing WLA or LSI modification (case-insensitive)"
-REVIEWER_RULE = "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
+PHASE_RULE = (
+    "All phases except values containing WLA or LSI modification (case-insensitive)"
+)
+REVIEWER_RULE = (
+    "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
+)
 
 
 def normalized(value):
@@ -74,8 +78,11 @@ def eligibility(row, config, epoch, now, reporting_month=None, *, all_dates=Fals
             excluded.append(f"Phase contains {text}: {row.get('Phase')}")
     try:
         submitted = (
-            None if all_dates and "Document Submitted" not in row
-            else submitted_date(row.get("Document Submitted"), epoch, config["timezone"])
+            None
+            if all_dates and "Document Submitted" not in row
+            else submitted_date(
+                row.get("Document Submitted"), epoch, config["timezone"]
+            )
         )
         if not all_dates:
             start, end = month_bounds(now, config["timezone"], reporting_month)

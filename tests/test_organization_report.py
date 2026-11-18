@@ -94,9 +94,14 @@ def test_organization_columns_report_selection_and_restart(tmp_path):
 
 @pytest.mark.parametrize(
     "column, value",
-    [("B", "Other Forum"), ("C", "Other Reviewer"),
-     ("E", "WLA"), ("E", "LSI Modification"),
-     ("F", datetime(2025, 1, 1)), ("F", None)],
+    [
+        ("B", "Other Forum"),
+        ("C", "Other Reviewer"),
+        ("E", "WLA"),
+        ("E", "LSI Modification"),
+        ("F", datetime(2025, 1, 1)),
+        ("F", None),
+    ],
 )
 def test_only_dashboard_eligible_managers_are_queried(tmp_path, column, value):
     original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
@@ -150,6 +155,7 @@ def test_final_filter_completes_before_single_batch_and_single_setup(
     book = load_workbook(original)
     sheet = book.active
     sheet["A5"] = "Other Selected Manager"
+    sheet["G5"].hyperlink = sheet["G4"].hyperlink.target.replace("123", "456")
     for name in ("Excluded One", "Excluded Two"):
         sheet.append([cell.value for cell in sheet[4]])
         sheet.cell(sheet.max_row, 1, name)
@@ -234,7 +240,7 @@ def test_missing_datasyncx_runtime_can_be_selected_and_retried(tmp_path, monkeyp
         datetime(2026, 10, 30, tzinfo=timezone.utc),
         on_directory_unavailable=setup,
     )
-    assert counts["Qualified"] == 2 and calls == [None, "approved-python.exe"]
+    assert counts["Qualified"] == 1 and calls == [None, "approved-python.exe"]
     assert len(prompts) == 1 and "no DataSyncX" in prompts[0]
     assert load_settings()["organization_python"] == "approved-python.exe"
     assert len(OrganizationCache().entries) == 1

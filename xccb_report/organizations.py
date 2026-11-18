@@ -177,8 +177,9 @@ class OrganizationCache:
         results, issues = {}, {}
         unique = {}
         for name in names:
-            if normalized(name):
-                unique.setdefault(normalized(name), str(name))
+            key = normalized(name)
+            if key:
+                unique.setdefault(key, str(name))
         unavailable = ""
         work = []
         for index, (key, name) in enumerate(unique.items(), 1):
@@ -195,7 +196,7 @@ class OrganizationCache:
             if batch_query is not None:
                 if not work:
                     return
-                rows_by_name, error = {}, ""
+                error = ""
                 try:
                     if cancel and cancel.is_set():
                         raise DirectoryUnavailable(
@@ -307,22 +308,16 @@ class OrganizationCache:
                     entry = Organization(
                         name,
                         key,
-                        str(chosen["wwid"]),
-                        str(chosen["organization_code"]),
+                        chosen["wwid"],
+                        chosen["organization_code"],
                         chosen["organization"],
                         datetime.now(timezone.utc).isoformat(),
                         confirmed,
                         chosen["name"] if batch_query is not None else "",
                     )
-                    if (
-                        not entry.organization_code.strip()
-                        or not entry.organization.strip()
-                    ):
-                        raise ValueError("HR match has no organization")
                     self.save(entry)
                     results[key] = entry
             except (
-                DirectoryUnavailable,
                 OSError,
                 ValueError,
                 TypeError,
@@ -330,7 +325,7 @@ class OrganizationCache:
             ) as exc:
                 issues[key] = (
                     str(exc)
-                    if isinstance(exc, (DirectoryUnavailable, ValueError))
+                    if isinstance(exc, ValueError)
                     else f"Organization cache update failed ({type(exc).__name__}); check cache permissions"
                 )
             if (
@@ -356,9 +351,8 @@ def load_settings(path=None):
         if not isinstance(value, dict):
             raise ValueError("Settings must be an object")
         codes = value.setdefault("organization_codes", [])
-        if (
-            not isinstance(codes, list)
-            or any(not isinstance(code, str) or not code.strip() for code in codes)
+        if not isinstance(codes, list) or any(
+            not isinstance(code, str) or not code.strip() for code in codes
         ):
             raise ValueError("organization_codes must be a list of nonblank strings")
         if "organization_python" in value and not isinstance(

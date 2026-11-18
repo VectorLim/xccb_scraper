@@ -92,10 +92,10 @@ def test_report_preserves_links_and_caches_document(tmp_path, monkeypatch):
         datetime(2026, 10, 30, tzinfo=timezone.utc),
     )
     assert calls == ["123"]
-    assert counts["No"] == 2
+    assert counts["No"] == counts["Duplicate"] == 1
     book = load_workbook(output)
     tab = book["Flawless submissions"]
-    assert tab.max_column == 46 and tab.max_row == 3
+    assert tab.max_column == 46 and tab.max_row == 2
     assert tab["A1"].fill.fgColor.rgb == "00123456"
     assert tab.column_dimensions["A"].fill.fgColor.rgb == "00ABCDEF"
     assert tab["I2"].hyperlink.target == URL
@@ -104,18 +104,21 @@ def test_report_preserves_links_and_caches_document(tmp_path, monkeypatch):
     assert tab["K2"].data_type == "s" and tab["K2"].value.startswith("=HYPERLINK")
     assert tab["G1"].value == "Document" and tab["G2"].value is None
     assert book["Audit"].max_row == 3
-    assert tab.auto_filter.ref == "A1:AT3"
+    assert tab.auto_filter.ref == "A1:AT2"
     assert load_workbook(original).active.max_row == 5
     with pytest.raises(ValueError, match="never overwritten"):
         report(original, output, config(), tmp_path)
 
 
-@pytest.mark.parametrize("workspace_titles, expected", [
-    (["Whitepaper & document.docm"], "Whitepaper & document.docm"),
-    (["=A title, not a formula"], "=A title, not a formula"),
-    ([], ""),
-    (["First document.docx", "Second document.docx"], ""),
-])
+@pytest.mark.parametrize(
+    "workspace_titles, expected",
+    [
+        (["Whitepaper & document.docm"], "Whitepaper & document.docm"),
+        (["=A title, not a formula"], "=A title, not a formula"),
+        ([], ""),
+        (["First document.docx", "Second document.docx"], ""),
+    ],
+)
 def test_document_title_is_between_phase_and_submitted_in_export_and_dashboard(
     tmp_path, workspace_titles, expected
 ):
@@ -140,37 +143,49 @@ def test_document_title_is_between_phase_and_submitted_in_export_and_dashboard(
             self.urls.append(url)
             if url == FRAME:
                 return HTML
-            return '<div id="ctl00_PlaceHolderContentDescription_ctl01_DocumentTitleCell">' + "".join(
-                '<a onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">'
-                + escape(title) + "</a>" for title in workspace_titles
-            ) + '</div><a id="ctl00_PlaceHolderToolbar_ctl00_tb_view" onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">V iew</a>' + '<iframe id="iFrameActions" src="DocumentComponents.aspx?Component=Actions&amp;DocumentID=123"></iframe>'
+            return (
+                '<div id="ctl00_PlaceHolderContentDescription_ctl01_DocumentTitleCell">'
+                + "".join(
+                    "<a onclick=\"return ViewOnlineDocument('https://example.invalid/paper.docm')\">"
+                    + escape(title)
+                    + "</a>"
+                    for title in workspace_titles
+                )
+                + '</div><a id="ctl00_PlaceHolderToolbar_ctl00_tb_view" onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">V iew</a>'
+                + '<iframe id="iFrameActions" src="DocumentComponents.aspx?Component=Actions&amp;DocumentID=123"></iframe>'
+            )
 
     reader, progress = Reader(), []
     report(
-        original, output, config(), tmp_path, reader=reader,
-        reporting_month="2026-10", on_progress=lambda *args: progress.append(args),
+        original,
+        output,
+        config(),
+        tmp_path,
+        reader=reader,
+        reporting_month="2026-10",
+        on_progress=lambda *args: progress.append(args),
     )
     assert reader.urls == [URL, FRAME]
-    assert all(entry[2]["title"] == expected for entry in progress)
+    assert all(entry[2]["title"] == expected for entry in progress if entry[2] is not None)
     book = load_workbook(output)
     sheet = book["Flawless submissions"]
     headers = [cell.value for cell in sheet[1]]
     phase = headers.index("Phase")
-    assert headers[phase:phase + 3] == ["Phase", "Document", "Document Submitted"]
+    assert headers[phase : phase + 3] == ["Phase", "Document", "Document Submitted"]
     assert "CCB Title" not in headers
     assert (sheet.cell(2, phase + 2).value or "") == expected
-    assert (sheet.cell(3, phase + 2).value or "") == expected
+    assert sheet.max_row == 2
     if expected:
-        assert sheet.cell(3, phase + 2).data_type == "s"
+        assert sheet.cell(2, phase + 2).data_type == "s"
     else:
         assert "Document title unavailable" in book["Audit"]["H2"].value
     book.close()
     _, _, documents = read_results(output)
     columns = [column[1] for column in DOCUMENT_COLUMNS]
     phase = columns.index("Phase")
-    assert columns[phase:phase + 3] == ["Phase", "Document", "Submitted"]
+    assert columns[phase : phase + 3] == ["Phase", "Document", "Submitted"]
     assert documents[0][phase + 1] == expected
-    assert documents[1][phase + 1] == expected
+    assert len(documents) == 1
     offline_output = tmp_path / "offline.xlsx"
     report(original, offline_output, config(), tmp_path, reporting_month="2026-10")
     assert read_results(offline_output)[2] == documents
@@ -208,7 +223,7 @@ def test_reporting_month_does_not_change_evidence_time(tmp_path, monkeypatch):
     now = datetime(2026, 11, 2, tzinfo=timezone.utc)
     evidence_times = []
 
-    def evidence(directory, document_id, settings, checked_at):
+    def evidence(directory, document_id, settings, checked_at, details=None):
         evidence_times.append(checked_at)
         return [], True, "Validated", "local-evidence"
 
@@ -216,7 +231,7 @@ def test_reporting_month_does_not_change_evidence_time(tmp_path, monkeypatch):
     counts = report(
         original, output, config(), tmp_path, now=now, reporting_month="2026-10"
     )
-    assert counts["Qualified"] == counts["Yes"] == 2
+    assert counts["Qualified"] == counts["Yes"] == 1
     assert evidence_times == [now]
     book = load_workbook(output)
     try:
@@ -273,9 +288,9 @@ def test_live_capture_uses_observed_frame_and_sanitizes(tmp_path):
             self.urls.append(url)
             return (
                 '<div id="ctl00_PlaceHolderContentDescription_ctl01_DocumentTitleCell">'
-                'Different CCB heading [Class IV]'
-                '<a onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">'
-                'Whitepaper &amp; document.docm</a></div>'
+                "Different CCB heading [Class IV]"
+                "<a onclick=\"return ViewOnlineDocument('https://example.invalid/paper.docm')\">"
+                "Whitepaper &amp; document.docm</a></div>"
                 '<a id="ctl00_PlaceHolderToolbar_ctl00_tb_view" onclick="return ViewOnlineDocument(\'https://example.invalid/paper.docm\')">V iew</a>'
                 '<iframe id="iFrameActions" src="DocumentComponents.aspx?Component=Actions&amp;DocumentID=123"></iframe>'
                 if len(self.urls) == 1
@@ -299,7 +314,10 @@ def test_live_capture_uses_observed_frame_and_sanitizes(tmp_path):
     from xccb_report.evidence import load_document_title
 
     now = datetime.now(timezone.utc)
-    assert load_document_title(tmp_path, "123", config(), now) == "Whitepaper & document.docm"
+    assert (
+        load_document_title(tmp_path, "123", config(), now)
+        == "Whitepaper & document.docm"
+    )
     assert load_document_title(tmp_path, "123", config(), now + timedelta(days=2)) == ""
     Path(result["source"]).write_text(clean + "tampered", encoding="utf-8")
     assert load_document_title(tmp_path, "123", config(), now) == ""
@@ -334,7 +352,7 @@ def test_cli_runs_report_with_conventional_paths(tmp_path, monkeypatch, live):
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     reader, calls = object(), []
-    monkeypatch.setattr("xccb_report.__main__.WindowsReader", lambda: reader)
+    monkeypatch.setattr("xccb_report.__main__.WindowsReader", lambda **kwargs: reader)
     monkeypatch.setattr(
         "xccb_report.__main__.report",
         lambda *args, **kwargs: calls.append((args, kwargs)) or {},
@@ -438,7 +456,10 @@ def test_report_applies_amended_filters(tmp_path, excluded_phase):
         summary["Phase rule"]
         == "All phases except values containing WLA or LSI modification (case-insensitive)"
     )
-    assert summary["Reviewer rule"] == "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
+    assert (
+        summary["Reviewer rule"]
+        == "Reviewer(s) is blank or contains a listed reviewer name (case-insensitive)"
+    )
     assert "Phase contains" in book["Audit"]["H3"].value
     book.close()
 
@@ -450,9 +471,10 @@ def test_report_groups_managers_without_excluding_missing_or_unmapped_names(tmp_
     sheet = book.active
     sheet["A4"] = "Z Manager"
     sheet["A5"] = "A Manager"
+    sheet["G5"].hyperlink = URL.replace("123", "456")
     sheet.append([c.value for c in sheet[4]])
     sheet["A6"] = None
-    sheet["G6"].hyperlink = URL
+    sheet["G6"].hyperlink = URL.replace("123", "789")
     book.save(original)
     book.close()
     counts = report(
@@ -502,7 +524,7 @@ def test_live_capture_is_not_future_dated_against_report_start(tmp_path, monkeyp
 
     monkeypatch.setattr("xccb_report.site.capture", fresh_capture)
     counts = report(original, output, config(), tmp_path, reader=object())
-    assert counts["No"] == 2
+    assert counts["No"] == 1
     assert "Unresolved Actions" not in counts
 
 
@@ -526,7 +548,7 @@ def test_live_failure_does_not_reuse_previous_success(tmp_path, monkeypatch):
         datetime(2026, 10, 30, tzinfo=timezone.utc),
         reader=object(),
     )
-    assert counts["Unresolved Actions"] == 2
+    assert counts["Unresolved Actions"] == 1
     assert load_workbook(output)["Flawless submissions"]["AS2"].value is None
 
 
@@ -560,6 +582,8 @@ def test_report_streams_completed_documents_concurrently_in_source_order(
 
     def progress(counts, group, document):
         assert not output.exists()
+        if document is None:
+            return
         assert document["result"] == "No" and document["matches"] == "Person, One"
         updates.append((counts, group))
         if group[0] == "Z Fast Manager":
@@ -586,12 +610,12 @@ def test_report_streams_completed_documents_concurrently_in_source_order(
     )
     assert sorted(captures) == sorted([URL, fast_url])
     assert updates[0] == (
-        {"No": 1, "Qualified": 1},
+        {"Duplicate": 1, "No": 1, "Qualified": 1},
         ("Z Fast Manager", "Unresolved", 1, 0, 1, 0),
     )
-    assert updates[1][1] == ("Z Fast Manager", "Unresolved", 2, 0, 2, 0)
+    assert updates[1][1] == ("A Slow Manager", "Unresolved", 1, 0, 1, 0)
     assert updates[-1][0] == counts
-    assert counts["Qualified"] == counts["No"] == 3
+    assert counts["Qualified"] == counts["No"] == 2
     book = load_workbook(output)
     try:
         assert [
@@ -599,16 +623,201 @@ def test_report_streams_completed_documents_concurrently_in_source_order(
             for row in book["Flawless submissions"].iter_rows(
                 min_row=2, values_only=True
             )
-        ] == ["A Slow Manager", "Z Fast Manager", "Z Fast Manager"]
+        ] == ["A Slow Manager", "Z Fast Manager"]
         assert [
             row[0] for row in book["Audit"].iter_rows(min_row=2, values_only=True)
         ] == [4, 5, 6]
         assert list(book["By Author Manager"].values)[1:] == [
             ("A Slow Manager", "Unresolved", 1, 0, 1, 0),
-            ("Z Fast Manager", "Unresolved", 2, 0, 2, 0),
+            ("Z Fast Manager", "Unresolved", 1, 0, 1, 0),
         ]
     finally:
         book.close()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "fresh",
+        "expired",
+        "tampered",
+        "incomplete",
+        "future",
+        "scope",
+        "identity",
+        "missing",
+        "force",
+    ],
+)
+def test_live_evidence_cache_only_reuses_fresh_valid_complete_documents(
+    tmp_path, state
+):
+    from datetime import timedelta
+
+    original = tmp_path / "source.xlsx"
+    source(original)
+    calls = []
+
+    class Reader:
+        def get(self, url):
+            calls.append(url)
+            return (
+                f'<iframe id="iFrameActions" src="{FRAME}"></iframe>'
+                if url == URL
+                else HTML
+            )
+
+    report(
+        original,
+        tmp_path / "first.xlsx",
+        config(),
+        tmp_path,
+        reader=Reader(),
+        all_dates=True,
+    )
+    assert len(calls) == 2
+    manifest = tmp_path / "123.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    if state == "expired":
+        value["captured_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=16)
+        ).isoformat()
+    elif state == "future":
+        value["captured_at"] = (
+            datetime.now(timezone.utc) + timedelta(minutes=1)
+        ).isoformat()
+    elif state == "tampered":
+        (tmp_path / "123.html").write_text("changed", encoding="utf-8")
+    elif state == "incomplete":
+        value["complete"] = False
+    elif state == "scope":
+        value["scope"] = "unconfirmed"
+    elif state == "identity":
+        value["document_id"] = "456"
+    write_json(manifest, value)
+    if state == "missing":
+        manifest.unlink()
+    calls.clear()
+    settings = config() | {"reuse_evidence": state != "force", "live_cache_minutes": 15}
+    counts = report(
+        original,
+        tmp_path / "second.xlsx",
+        settings,
+        tmp_path,
+        reader=Reader(),
+        all_dates=True,
+    )
+    assert counts["No"] == 1
+    assert len(calls) == (0 if state == "fresh" else 2)
+    book = load_workbook(tmp_path / "second.xlsx")
+    try:
+        summary = dict(book["Summary"].values)
+        assert summary["Fresh evidence cache hits"] == (1 if state == "fresh" else 0)
+        assert ("fresh cache reused" in book["Audit"]["H2"].value) == (state == "fresh")
+    finally:
+        book.close()
+
+
+def test_session_reader_reuses_per_thread_sessions_and_closes_them(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+    from threading import Barrier
+    from types import SimpleNamespace
+    from xccb_report.site import WindowsReader
+
+    sessions, options = [], []
+    overlap = Barrier(2)
+
+    class Session:
+        def __init__(self):
+            self.closed = False
+            self.calls = 0
+            sessions.append(self)
+
+        def mount(self, prefix, adapter):
+            assert prefix == "https://"
+            assert adapter.context.verify_mode.name == "CERT_REQUIRED"
+
+        def get(self, url, **kwargs):
+            options.append(kwargs)
+            self.calls += 1
+            return nullcontext(SimpleNamespace(status_code=200, url=url, text="body"))
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("xccb_report.site.requests.Session", Session)
+    monkeypatch.setattr("requests_negotiate_sspi.HttpNegotiateAuth", lambda: object())
+    monkeypatch.setattr("xccb_report.site.time.sleep", lambda _: None)
+    reader = WindowsReader()
+
+    def fetch(_):
+        overlap.wait(timeout=5)
+        return reader.get(URL), reader.get(FRAME)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            assert list(executor.map(fetch, range(2))) == [("body", "body")] * 2
+        assert len(sessions) == 2 and all(session.calls == 2 for session in sessions)
+        assert options == [{"allow_redirects": False, "timeout": (10, 25)}] * 4
+        assert reader.metrics["requests"] == 4
+    finally:
+        reader.close()
+    assert all(session.closed for session in sessions)
+
+
+@pytest.mark.parametrize(
+    "status, attempts", [(403, 1), (401, 1), (302, 1), (503, 2), (429, 2)]
+)
+def test_session_reader_preserves_http_error_retry_rules(monkeypatch, status, attempts):
+    from xccb_report.site import WindowsReader
+
+    reader, calls = WindowsReader(), []
+
+    def response(url):
+        calls.append(url)
+        return {"status": status, "url": url, "html": ""}
+
+    monkeypatch.setattr(reader, "_request", response)
+    monkeypatch.setattr("xccb_report.site.time.sleep", lambda _: None)
+    with pytest.raises(OSError, match=str(status)):
+        reader.get(URL)
+    assert len(calls) == attempts
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://xccb2.intel.com/",
+        "https://example.com/",
+        "https://xccb2.intel.com.evil.example/",
+    ],
+)
+def test_session_reader_rejects_unapproved_hosts(url):
+    from xccb_report.site import WindowsReader
+
+    with pytest.raises(ValueError, match="approved HTTPS"):
+        WindowsReader().get(url)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"document_workers": 0},
+        {"document_workers": 17},
+        {"document_workers": True},
+        {"request_interval_seconds": 0},
+        {"request_interval_seconds": float("nan")},
+        {"live_cache_minutes": -1},
+        {"reuse_evidence": "yes"},
+        {"http_transport": "unknown"},
+    ],
+)
+def test_performance_settings_reject_invalid_values(updates):
+    from xccb_report.config import validate_performance
+
+    with pytest.raises(ValueError):
+        validate_performance(config() | updates)
 
 
 def test_windows_reader_overlaps_io_with_shared_request_spacing(monkeypatch):
@@ -640,7 +849,7 @@ def test_windows_reader_overlaps_io_with_shared_request_spacing(monkeypatch):
     monkeypatch.setattr("xccb_report.site.time.monotonic", lambda: clock[0])
     monkeypatch.setattr("xccb_report.site.time.sleep", sleep)
     monkeypatch.setattr("xccb_report.site.subprocess.run", get_response)
-    reader = WindowsReader()
+    reader = WindowsReader(transport="powershell")
     with ThreadPoolExecutor(max_workers=2) as executor:
         assert list(executor.map(reader.get, [URL, URL.replace("123", "456")])) == [
             "response",
@@ -753,10 +962,10 @@ def test_dashboard_displays_progress_before_completion(tmp_path, monkeypatch):
         assert dashboard.table.item(dashboard.table.get_children()[0], "values") == (
             "Manager, One",
             "Unresolved",
-            "2",
+            "1",
             "0",
             "0",
-            "2",
+            "1",
         )
     finally:
         release.set()
@@ -815,25 +1024,26 @@ def test_dashboard_generates_grouped_report_in_background(tmp_path, monkeypatch)
             time.sleep(0.01)
         assert not dashboard.running and not errors
         assert len(temporary_outputs) == 1 and not temporary_outputs[0].exists()
-        assert dashboard.card_values["Qualified"].get() == "2"
+        assert dashboard.card_values["Qualified"].get() == "1"
         assert dashboard.status.get().startswith("DRAFT")
         assert len(dashboard.table.get_children()) == 1
         assert dashboard.table.item(dashboard.table.get_children()[0], "values") == (
             "Manager, One",
             "Unresolved",
-            "2",
+            "1",
             "0",
             "0",
-            "2",
+            "1",
         )
         from xccb_report.config import load_preferences
+
         assert load_preferences()["reviewer_names"] == ["Reviewer, One"]
         assert not (tmp_path / "reviewer_names.txt").exists()
         rows = [
             dashboard.documents.item(item, "values")
             for item in dashboard.documents.get_children()
         ]
-        assert len(rows) == 2 and all(
+        assert len(rows) == 1 and all(
             row[0] == "Unresolved" and row[1] == "123" and row[-2] == URL and row[-1]
             for row in rows
         )
@@ -1013,7 +1223,9 @@ def test_json_preferences_import_names_once_and_preserve_other_settings(tmp_path
     save_settings(["04643"])
     assert load_preferences(legacy)["reviewer_names"] == ["Doe, Jane"]
     legacy.write_text("Other Person\n", encoding="utf-8")
-    save_preferences({"column_filters": {"Phase": {"mode": "value", "values": ["Final"]}}})
+    save_preferences(
+        {"column_filters": {"Phase": {"mode": "value", "values": ["Final"]}}}
+    )
     preferences = load_preferences(legacy)
     assert preferences["reviewer_names"] == ["Doe, Jane"]
     assert preferences["column_filters"]["Phase"]["values"] == ["Final"]
@@ -1026,7 +1238,10 @@ def test_json_preferences_need_no_organization_fields(tmp_path):
 
     path = user_directory() / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"reviewer_names": ["Doe, Jane"], "column_filters": {}}), encoding="utf-8")
+    path.write_text(
+        json.dumps({"reviewer_names": ["Doe, Jane"], "column_filters": {}}),
+        encoding="utf-8",
+    )
     assert load_preferences()["reviewer_names"] == ["Doe, Jane"]
 
 
@@ -1092,7 +1307,9 @@ def test_dashboard_loads_legacy_names_once_then_reloads_json(tmp_path, monkeypat
         root.destroy()
 
 
-def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(tmp_path, monkeypatch):
+def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(
+    tmp_path, monkeypatch
+):
     import tkinter as tk
     from tkinter import ttk
     from xccb_report.config import load_preferences, save_preferences
@@ -1100,21 +1317,53 @@ def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(tmp_p
     from xccb_report.results import document_row
 
     monkeypatch.chdir(tmp_path)
-    save_preferences({
-        "reviewer_names": ["Doe, Jane"],
-        "column_filters": {
-            "Submitted": {"mode": "month", "values": ["2026-10"]},
-            "Missing workbook column": {"mode": "value", "values": ["irrelevant"]},
-        },
-    })
+    save_preferences(
+        {
+            "reviewer_names": ["Doe, Jane"],
+            "column_filters": {
+                "Submitted": {"mode": "month", "values": ["2026-10"]},
+                "Missing workbook column": {"mode": "value", "values": ["irrelevant"]},
+            },
+        }
+    )
     root = tk.Tk()
     root.withdraw()
     try:
         dashboard = Dashboard(root)
         dashboard.documents_data = [
-            document_row("Yes", "1", "Title", "Manager", "Final", datetime(2026, 10, 1), URL, "", ""),
-            document_row("Yes", "2", "Title", "Manager", "Final", datetime(2026, 10, 12), URL, "", ""),
-            document_row("Yes", "3", "Title", "Manager", "Final", datetime(2026, 9, 1), URL, "", ""),
+            document_row(
+                "Yes",
+                "1",
+                "Title",
+                "Manager",
+                "Final",
+                datetime(2026, 10, 1),
+                URL,
+                "",
+                "",
+            ),
+            document_row(
+                "Yes",
+                "2",
+                "Title",
+                "Manager",
+                "Final",
+                datetime(2026, 10, 12),
+                URL,
+                "",
+                "",
+            ),
+            document_row(
+                "Yes",
+                "3",
+                "Title",
+                "Manager",
+                "Final",
+                datetime(2026, 9, 1),
+                URL,
+                "",
+                "",
+            ),
         ]
         dashboard.render_documents()
         assert len(dashboard.documents.get_children()) == 2
@@ -1124,17 +1373,57 @@ def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(tmp_p
         dashboard.save_table_filters()
         dashboard.render_documents()
         assert len(dashboard.documents.get_children()) == 1
-        assert load_preferences()["column_filters"]["Submitted"] == {"mode": "day", "values": ["2026-10-12"]}
+        assert load_preferences()["column_filters"]["Submitted"] == {
+            "mode": "day",
+            "values": ["2026-10-12"],
+        }
         root.deiconify()
         root.update()
         popup = dashboard.open_column_filter(6)
-        picker = next(widget for widget in popup.winfo_children() if isinstance(widget, ttk.Combobox))
+        picker = next(
+            widget
+            for widget in popup.winfo_children()
+            if isinstance(widget, ttk.Combobox)
+        )
+        selection_buttons = next(
+            widget
+            for widget in popup.winfo_children()
+            if any(
+                isinstance(child, ttk.Button) and child.cget("text") == "Select all"
+                for child in widget.winfo_children()
+            )
+        )
+        assert picker.grid_info()["row"] == selection_buttons.grid_info()["row"]
+        root.update_idletasks()
+        assert (
+            picker.winfo_rootx()
+            >= selection_buttons.winfo_rootx() + selection_buttons.winfo_width()
+        )
+        visible_columns = (
+            "result",
+            "submitted",
+            "manager",
+            "organization",
+            "reviewers",
+            "activity",
+            "phase",
+            "title",
+            "url",
+            "notes",
+        )
+        assert tuple(dashboard.documents.cget("displaycolumns")) == visible_columns
         picker.set("Month")
         picker.event_generate("<<ComboboxSelected>>")
         root.update()
         assert dashboard.date_modes[6] == "month"
         assert 6 not in dashboard.column_filters
         dashboard.close_column_filter()
+        original = tmp_path / "source.xlsx"
+        source(original)
+        dashboard.configure_workbook_columns(original)
+        assert tuple(dashboard.documents.cget("displaycolumns")) == tuple(
+            column for column in visible_columns if column != "activity"
+        )
         restarted = tk.Toplevel(root)
         second = Dashboard(restarted)
         assert second.date_modes[6] == "month"
@@ -1145,18 +1434,113 @@ def test_dashboard_date_filters_persist_by_name_and_ignore_missing_columns(tmp_p
         root.destroy()
 
 
+def test_report_retains_existing_exe_features_with_new_phase_position(tmp_path, monkeypatch):
+    from xccb_report.results import document_row, read_results
+
+    original, output = tmp_path / "source.xlsx", tmp_path / "report.xlsx"
+    source(original)
+    book = load_workbook(original)
+    book.active["AQ3"] = "Activity Status"
+    book.active["AQ4"] = "Approved"
+    book.active["AQ5"] = "Cancelled"
+    book.save(original)
+    book.close()
+    monkeypatch.setattr(
+        "xccb_report.pipeline.load_evidence",
+        lambda *args: ([{"assigned_by": "Person, One"}], True, "Validated", "local-evidence"),
+    )
+    progress = []
+    counts = report(original, output, config(), tmp_path, all_dates=True, on_progress=lambda *args: progress.append(args))
+    assert counts["Qualified"] == counts["No"] == counts["Duplicate"] == 1
+    status, groups, rows = read_results(output)
+    assert len(rows) == 1
+    assert rows == [document_row(**entry[2]) for entry in progress if entry[2] is not None]
+    assert rows[0][4] == "Final "
+    assert rows[0][7:9] == ("Approved", "Reviewer, One")
+    assert sum(group[2] for group in groups) == 1
+    book = load_workbook(output)
+    assert book["Flawless submissions"].max_row == 2
+    assert len([row for row in book["Audit"].values if row[3] == "Duplicate"]) == 1
+    assert dict(book["Summary"].values)["Duplicate rows skipped"] == 1
+    book.close()
+
+
+@pytest.mark.parametrize("with_activity", [False, True])
+def test_dashboard_phase_follows_activity_without_losing_features(tmp_path, monkeypatch, with_activity):
+    import tkinter as tk
+    from xccb_report.gui import Dashboard, DOCUMENT_COLUMNS
+    from xccb_report.results import document_row
+
+    monkeypatch.chdir(tmp_path)
+    original = tmp_path / "source.xlsx"
+    source(original)
+    if with_activity:
+        book = load_workbook(original)
+        book.active["AQ3"] = "Activity Status"
+        book.active["AQ4"] = "Approved"
+        book.save(original)
+        book.close()
+    root = tk.Tk()
+    try:
+        dashboard = Dashboard(root)
+        dashboard.configure_workbook_columns(original)
+        visible = tuple(dashboard.documents.cget("displaycolumns"))
+        assert visible[:2] == ("result", "submitted")
+        assert "reviewers" in visible
+        if with_activity:
+            assert visible[visible.index("activity") + 1] == "phase"
+        else:
+            assert "activity" not in visible and "phase" in visible
+        phase = "ATM PCS Post TFC - Control Limit/RFC "
+        dashboard.documents_data = [
+            document_row("Yes", "123", "Zulu", "Manager", phase, None, URL, "", "", activity="Approved", reviewers="Reviewer, One"),
+            document_row("No", "456", "Alpha", "Manager", "Preliminary ", None, URL.replace("123", "456"), "", "", activity="Cancelled", reviewers="Reviewer, Two"),
+        ]
+        dashboard.render_documents()
+        title = next(index for index, column in enumerate(DOCUMENT_COLUMNS) if column[0] == "title")
+        dashboard.toggle_document_sort(title)
+        items = dashboard.documents.get_children()
+        assert [dashboard.documents.set(item, "title") for item in items] == ["Alpha", "Zulu"]
+        assert dashboard.documents.set(items[1], "phase") == phase
+        assert dashboard.documents.set(items[1], "reviewers") == "Reviewer, One"
+        dashboard.toggle_document_sort(title)
+        assert [dashboard.documents.set(item, "title") for item in dashboard.documents.get_children()] == ["Zulu", "Alpha"]
+        root.update()
+        dashboard.documents.xview_moveto(1)
+        root.update()
+        if with_activity:
+            assert dashboard.activity_labels
+            for item, label in dashboard.activity_labels.items():
+                result = dashboard.documents.set(item, "result")
+                tag = "yes" if result == "Yes" else "no"
+                assert label.cget("background") == str(dashboard.documents.tag_configure(tag, "background"))
+                assert label.cget("font") == str(dashboard.pending_font)
+                assert label.cget("foreground") == ("#1E7B34" if result == "Yes" else "#B3261E")
+        phase_index = next(index for index, column in enumerate(DOCUMENT_COLUMNS) if column[0] == "phase")
+        dashboard.open_column_filter(phase_index)
+        assert dashboard.filter_popup is not None
+    finally:
+        root.destroy()
+
+
 def test_all_dates_processing_does_not_change_default_cli_month(tmp_path):
     original = tmp_path / "source.xlsx"
     source(original)
     now = datetime(2026, 11, 4, tzinfo=timezone.utc)
     current = report(original, tmp_path / "current.xlsx", config(), tmp_path, now=now)
-    all_dates = report(original, tmp_path / "all.xlsx", config(), tmp_path, now=now, all_dates=True)
+    all_dates = report(
+        original, tmp_path / "all.xlsx", config(), tmp_path, now=now, all_dates=True
+    )
     assert current.get("Qualified", 0) == 0
-    assert all_dates["Qualified"] == 2
+    assert all_dates["Qualified"] == 1
 
 
-@pytest.mark.parametrize("missing, column", [("Phase", "phase"), ("Document Submitted", "submitted")])
-def test_missing_optional_workbook_columns_are_hidden_and_not_filtered(tmp_path, monkeypatch, missing, column):
+@pytest.mark.parametrize(
+    "missing, column", [("Phase", "phase"), ("Document Submitted", "submitted")]
+)
+def test_missing_optional_workbook_columns_are_hidden_and_not_filtered(
+    tmp_path, monkeypatch, missing, column
+):
     import tkinter as tk
     from xccb_report.config import save_preferences
     from xccb_report.gui import Dashboard, DOCUMENT_COLUMNS
@@ -1171,7 +1555,9 @@ def test_missing_optional_workbook_columns_are_hidden_and_not_filtered(tmp_path,
     book.save(original)
     book.close()
     title = next(title for name, title, _ in DOCUMENT_COLUMNS if name == column)
-    save_preferences({"column_filters": {title: {"mode": "value", "values": ["not present"]}}})
+    save_preferences(
+        {"column_filters": {title: {"mode": "value", "values": ["not present"]}}}
+    )
     counts = report(original, output, config(), tmp_path, all_dates=True)
     assert counts["Qualified"] == 2
     root = tk.Tk()

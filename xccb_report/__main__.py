@@ -18,17 +18,36 @@ def main():
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Capture fresh Actions before reporting; otherwise use saved evidence",
+        help="Read live Actions (fresh verified cache is optional); otherwise use saved evidence",
     )
+    parser.add_argument("--transport", choices=("session", "powershell"))
+    parser.add_argument("--interval", type=float, help="Seconds between request starts (0.1-60)")
+    parser.add_argument("--workers", type=int, help="Concurrent document workers (1-16)")
+    cache = parser.add_mutually_exclusive_group()
+    cache.add_argument("--reuse-evidence", action="store_true", help="Reuse fresh validated evidence")
+    cache.add_argument("--force-refresh", action="store_true", help="Bypass the live evidence cache")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
+        config = load_config("config.json")
+        for key, value in (
+            ("http_transport", args.transport),
+            ("request_interval_seconds", args.interval),
+            ("document_workers", args.workers),
+        ):
+            if value is not None:
+                config[key] = value
+        if args.reuse_evidence or args.force_refresh:
+            config["reuse_evidence"] = args.reuse_evidence
         counts = report(
             args.source,
             args.output,
-            load_config("config.json"),
+            config,
             "outputs/evidence",
-            reader=WindowsReader() if args.live else None,
+            reader=WindowsReader(
+                interval=config["request_interval_seconds"],
+                transport=config["http_transport"],
+            ) if args.live else None,
         )
         print(json.dumps(counts))
     except (OSError, ValueError) as exc:

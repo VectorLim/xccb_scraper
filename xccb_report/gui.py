@@ -14,10 +14,10 @@ import webbrowser
 
 from .actions import workspace_identity
 from .config import DEFAULTS, load_config, load_preferences, save_preferences
-from .organizations import OrganizationCache, load_settings
+from .organizations import OrganizationCache
 from .pipeline import report
-from .results import document_row, read_results
-from .workbook import read_source
+from .results import DOCUMENT_FIELDS, document_row, read_results
+from .workbook import activity_header, read_source
 from .site import WindowsReader
 from .reviewers import parse_names
 from .filtering import normalized
@@ -29,19 +29,35 @@ CARDS = (
     ("Unresolved", "Unresolved Actions"),
     ("Excluded", "Excluded"),
 )
-DOCUMENT_COLUMNS = (
-    ("result", "Flawless", 80),
-    ("document", "Document ID", 95),
-    ("manager", "Author Manager", 170),
-    ("organization", "Organization", 240),
-    ("phase", "Phase", 100),
-    ("title", "Document", 300),
-    ("submitted", "Submitted", 95),
-    ("url", "Document WS URL", 420),
-    ("notes", "Notes", 200),
+DOCUMENT_COLUMNS = tuple(
+    (key, title, width)
+    for (key, title), width in zip(
+        DOCUMENT_FIELDS, (80, 95, 170, 240, 100, 300, 95, 140, 240, 420, 200), strict=True
+    )
+)
+DOCUMENT_DISPLAY_COLUMNS = (
+    "result",
+    "submitted",
+    "manager",
+    "organization",
+    "reviewers",
+    "activity",
+    "phase",
+    "title",
+    "url",
+    "notes",
 )
 RESULT_FILTERS = ("All", "Yes", "No", "Unresolved")
 ROW_TAGS = {"Yes": "yes", "No": "no"}
+ACTIVITY_COLORS = {
+    "acknowledged": "#1565C0",
+    "acknowledge": "#1565C0",
+    "approved": "#1E7B34",
+    "awaiting review": "#A07800",
+    "awaiting": "#A07800",
+    "cancelled": "#B3261E",
+    "rejected": "#B3261E",
+}
 
 
 class Dashboard:
@@ -53,14 +69,12 @@ class Dashboard:
         self.manager_items = {}
         self.documents_data = []
         self.report_bytes = None
-        self.run_month = ""
         self.organization_refresh = False
         self.organization_warning = ""
         self.filter_popup = None
         self.filter_bindings = []
         self.organization_error = ""
         try:
-            load_settings()
             OrganizationCache()
         except (OSError, ValueError) as exc:
             self.organization_error = str(exc)
@@ -78,7 +92,7 @@ class Dashboard:
         config_path = home / "config.json"
         if config_path.exists():
             try:
-                self.config = load_config(config_path)
+                self.config = load_config(config_path, use_preferences=False)
             except Exception as exc:
                 messagebox.showerror("Configuration error", str(exc), parent=root)
         try:
@@ -130,6 +144,12 @@ class Dashboard:
             toolbar, text="Export Excel…", command=self.export, state="disabled"
         )
         self.export_button.grid(row=0, column=6, padx=(6, 0))
+        self.reuse_evidence = tk.BooleanVar(value=self.config["reuse_evidence"])
+        ttk.Checkbutton(
+            toolbar,
+            text=f"Reuse cache ({self.config['live_cache_minutes']:g}m)",
+            variable=self.reuse_evidence,
+        ).grid(row=0, column=2, padx=(8, 0))
 
         body = ttk.Frame(frame)
         body.grid(row=3, column=0, sticky="nsew")
@@ -271,7 +291,9 @@ class Dashboard:
 
     def build_documents_tab(self):
         self.load_table_filters()
-        self.available_columns = {column[0] for column in DOCUMENT_COLUMNS}
+        self.available_columns = set(DOCUMENT_DISPLAY_COLUMNS)
+        self.sort_column = None
+        self.sort_descending = False
         tab = ttk.Frame(self.tabs, padding=6)
         self.tabs.add(tab, text="Submissions")
         tab.columnconfigure(0, weight=1)
@@ -312,6 +334,7 @@ class Dashboard:
         self.documents = ttk.Treeview(
             tab,
             columns=[c[0] for c in DOCUMENT_COLUMNS],
+            displaycolumns=DOCUMENT_DISPLAY_COLUMNS,
             show="headings",
             selectmode="browse",
         )
@@ -319,7 +342,8 @@ class Dashboard:
             self.documents.heading(
                 column,
                 text=f"{title} ▾",
-                command=lambda index=index: self.open_column_filter(index),
+                anchor="w",
+                command=lambda index=index: self.toggle_document_sort(index),
             )
             self.documents.column(
                 column,
@@ -339,11 +363,18 @@ class Dashboard:
         )
         self.fit_columns()
         self.documents.grid(row=1, column=0, sticky="nsew")
-        self.add_scrollbars(tab, self.documents)
-        self.documents.bind("<Double-1>", lambda _event: self.open_link())
+        self.activity_labels = {}
+        self.activity_redraw = None
+        self.add_scrollbars(tab, self.documents, self.schedule_activity_cells)
+        self.documents.bind("<Configure>", self.schedule_activity_cells, add="+")
+        for event in ("<<TreeviewSelect>>", "<FocusIn>", "<FocusOut>"):
+            self.documents.bind(event, self.schedule_activity_cells, add="+")
+        self.documents.bind("<Button-1>", self.document_header_click, add="+")
+        self.documents.bind("<Button-3>", lambda event: self.document_header_click(event, filter_only=True))
+        self.documents.bind("<Double-1>", self.document_double_click)
         self.documents.bind("<Return>", lambda _event: self.open_link())
         self.documents.bind(
-            "<<TreeviewSelect>>", lambda _event: self.update_link_buttons()
+            "<<TreeviewSelect>>", lambda _event: self.update_link_buttons(), add="+"
         )
         self.documents.bind("<Control-c>", lambda _event: self.copy_link())
         self.empty_hint = ttk.Label(tab, text="", style="Muted.TLabel")
@@ -383,12 +414,73 @@ class Dashboard:
         self.table.bind("<Double-1>", lambda _event: self.show_manager())
 
     @staticmethod
-    def add_scrollbars(parent, tree):
+    def add_scrollbars(parent, tree, on_scroll=None):
         scroll_y = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
         scroll_y.grid(row=1, column=1, sticky="ns")
         scroll_x = ttk.Scrollbar(parent, orient="horizontal", command=tree.xview)
         scroll_x.grid(row=2, column=0, sticky="ew")
-        tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        def update_scroll(scrollbar, *position):
+            scrollbar.set(*position)
+            if on_scroll is not None:
+                on_scroll()
+
+        tree.configure(
+            yscrollcommand=lambda *position: update_scroll(scroll_y, *position),
+            xscrollcommand=lambda *position: update_scroll(scroll_x, *position),
+        )
+
+    def schedule_activity_cells(self, _event=None):
+        if self.activity_redraw is None:
+            self.activity_redraw = self.root.after_idle(self.draw_activity_cells)
+
+    def draw_activity_cells(self):
+        self.activity_redraw = None
+        visible = set()
+        style = ttk.Style(self.documents)
+        background = style.lookup("Treeview", "background") or "#FFFFFF"
+        selection = set(self.documents.selection())
+        if "activity" in self.documents.cget("displaycolumns"):
+            for item in self.documents.get_children():
+                value = self.documents.set(item, "activity")
+                color = ACTIVITY_COLORS.get(normalized(value))
+                bounds = self.documents.bbox(item, "activity")
+                if not color or not bounds:
+                    continue
+                left, top, width, height = bounds
+                right = min(left + width, self.documents.winfo_width() - 1)
+                if right <= max(1, left):
+                    continue
+                visible.add(item)
+                if item not in self.activity_labels:
+                    label = tk.Label(
+                        self.documents, anchor="w", padx=self.px(4),
+                        font=self.pending_font, borderwidth=0,
+                    )
+                    label.bind("<Button-1>", lambda _event, item=item: self.select_activity_row(item))
+                    label.bind("<Double-1>", lambda _event: self.open_link())
+                    label.bind(
+                        "<MouseWheel>",
+                        lambda event: self.documents.event_generate("<MouseWheel>", delta=event.delta, state=event.state),
+                    )
+                    self.activity_labels[item] = label
+                label = self.activity_labels[item]
+                tags = self.documents.item(item, "tags")
+                row_background = next(
+                    (shade for tag in tags if (shade := self.documents.tag_configure(tag, "background"))),
+                    background,
+                )
+                if item in selection:
+                    state = ("selected",) if self.documents.focus_get() == self.documents else ("selected", "!focus")
+                    row_background = style.lookup("Treeview", "background", state) or row_background
+                label.configure(text=value, foreground=color, background=row_background, font=self.pending_font)
+                label.place(x=max(1, left), y=top, width=right - max(1, left), height=height)
+        for item in set(self.activity_labels) - visible:
+            self.activity_labels.pop(item).destroy()
+
+    def select_activity_row(self, item):
+        self.documents.selection_set(item)
+        self.documents.focus(item)
+        self.documents.focus_set()
 
     def names_modified(self, _event):
         self.reviewers.edit_modified(False)
@@ -400,7 +492,12 @@ class Dashboard:
 
     def column_value(self, row, index):
         value = (row[index] or "Unresolved") if index == 0 else row[index]
-        if DOCUMENT_COLUMNS[index][0] == "submitted" and self.date_modes.get(index) == "month":
+        if DOCUMENT_COLUMNS[index][0] == "phase":
+            value = " ".join(value.split())
+        if (
+            DOCUMENT_COLUMNS[index][0] == "submitted"
+            and self.date_modes.get(index) == "month"
+        ):
             return value[:7]
         return value
 
@@ -412,19 +509,29 @@ class Dashboard:
                 if not selection.get("all", False):
                     self.column_filters[index] = set(selection["values"])
                 if title == "Submitted":
-                    self.date_modes[index] = "month" if selection.get("mode") == "month" else "day"
+                    self.date_modes[index] = (
+                        "month" if selection.get("mode") == "month" else "day"
+                    )
 
     def save_table_filters(self):
         filters = {
             DOCUMENT_COLUMNS[index][1]: {
-                "mode": self.date_modes.get(index, "day") if DOCUMENT_COLUMNS[index][0] == "submitted" else "value",
+                "mode": (
+                    self.date_modes.get(index, "day")
+                    if DOCUMENT_COLUMNS[index][0] == "submitted"
+                    else "value"
+                ),
                 "values": sorted(values),
             }
             for index, values in self.column_filters.items()
         }
         for index, mode in self.date_modes.items():
             if index not in self.column_filters:
-                filters[DOCUMENT_COLUMNS[index][1]] = {"mode": mode, "values": [], "all": True}
+                filters[DOCUMENT_COLUMNS[index][1]] = {
+                    "mode": mode,
+                    "values": [],
+                    "all": True,
+                }
         try:
             save_preferences({"column_filters": filters})
         except (OSError, ValueError) as exc:
@@ -440,12 +547,11 @@ class Dashboard:
         popup = ttk.Frame(self.root, relief="solid", borderwidth=1)
         self.filter_popup = popup
         self.root.update_idletasks()
+        visible_columns = self.documents.cget("displaycolumns")
         widths = [
-            int(self.documents.column(column, "width"))
-            for column, _, _ in DOCUMENT_COLUMNS
-            if column in self.available_columns
+            int(self.documents.column(column, "width")) for column in visible_columns
         ]
-        visible_index = sum(column in self.available_columns for column, _, _ in DOCUMENT_COLUMNS[:index])
+        visible_index = visible_columns.index(DOCUMENT_COLUMNS[index][0])
         offset = sum(widths[:visible_index]) - self.documents.xview()[0] * sum(widths)
         width = min(self.px(380), self.root.winfo_width() - 16)
         left = self.documents.winfo_rootx() - self.root.winfo_rootx() + round(offset)
@@ -466,8 +572,14 @@ class Dashboard:
         )
         if DOCUMENT_COLUMNS[index][0] == "submitted":
             mode = tk.StringVar(value=self.date_modes.get(index, "day").title())
-            picker = ttk.Combobox(popup, textvariable=mode, values=("Month", "Day"), state="readonly", width=8)
-            picker.grid(row=0, column=1, padx=8, pady=(6, 0))
+            picker = ttk.Combobox(
+                popup,
+                textvariable=mode,
+                values=("Month", "Day"),
+                state="readonly",
+                width=8,
+            )
+            picker.grid(row=2, column=1, padx=(0, 8))
 
             def change_mode(_event):
                 self.date_modes[index] = mode.get().lower()
@@ -486,7 +598,13 @@ class Dashboard:
             for value in sorted(values, key=normalized)
         }
         buttons = ttk.Frame(popup)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8)
+        buttons.grid(
+            row=2,
+            column=0,
+            columnspan=1 if DOCUMENT_COLUMNS[index][0] == "submitted" else 2,
+            sticky="ew",
+            padx=8,
+        )
 
         def select_visible(state):
             for value, variable in choices.items():
@@ -635,20 +753,68 @@ class Dashboard:
             tags=(ROW_TAGS.get(row[0], "pending"),),
         )
 
+    def document_header_click(self, event, filter_only=False):
+        if self.documents.identify_region(event.x, event.y) != "heading":
+            return
+        visible = tuple(self.documents.cget("displaycolumns"))
+        column = visible[int(self.documents.identify_column(event.x)[1:]) - 1]
+        index = next(index for index, entry in enumerate(DOCUMENT_COLUMNS) if entry[0] == column)
+        widths = [int(self.documents.column(name, "width")) for name in visible]
+        left = sum(widths[:visible.index(column)]) - self.documents.xview()[0] * sum(widths)
+        heading = self.documents.heading(column, "text")
+        filter_left = left + self.px(6) + self.heading_font.measure(heading.rsplit(" ", 1)[0] + " ")
+        if filter_only or filter_left - self.px(4) <= event.x <= filter_left + self.px(18):
+            self.open_column_filter(index)
+        else:
+            self.toggle_document_sort(index)
+        return "break"
+
+    def document_double_click(self, event):
+        if self.documents.identify_region(event.x, event.y) == "heading":
+            return self.document_header_click(event)
+        if self.documents.identify_region(event.x, event.y) == "cell":
+            self.open_link()
+
+    def toggle_document_sort(self, index):
+        column = DOCUMENT_COLUMNS[index][0]
+        if column not in self.available_columns:
+            return
+        self.close_column_filter()
+        self.sort_descending = not self.sort_descending if self.sort_column == column else False
+        self.sort_column = column
+        self.sort_documents()
+        self.fit_columns()
+
+    def sort_documents(self):
+        if self.sort_column not in self.available_columns:
+            return
+
+        def key(item):
+            value = self.documents.set(item, self.sort_column)
+            if self.sort_column == "document":
+                return (0, int(value)) if value.isdigit() else (1, normalized(value))
+            return normalized(value)
+
+        for position, item in enumerate(sorted(self.documents.get_children(), key=key, reverse=self.sort_descending)):
+            self.documents.move(item, "", position)
+
     def fit_columns(self, rows=None, grow=False):
         pad = self.px(18)
         for index, (column, title, _) in enumerate(DOCUMENT_COLUMNS):
-            heading = f"{title} {'●' if index in self.column_filters else '▾'}"
+            direction = (" ↓" if self.sort_descending else " ↑") if column == self.sort_column else ""
+            heading = f"{title}{direction} {'●' if index in self.column_filters else '▾'}"
             self.documents.heading(column, text=heading)
             width = self.heading_font.measure(heading)
             for row in self.documents_data if rows is None else rows:
                 value = row[index] or ("Unresolved" if index == 0 else "")
-                font = self.row_font if row[0] in ROW_TAGS else self.pending_font
+                font = self.pending_font if column == "activity" or row[0] not in ROW_TAGS else self.row_font
                 width = max(width, font.measure(value))
             width += pad
             if grow:
                 width = max(width, int(self.documents.column(column, "width")))
             self.documents.column(column, width=width)
+        if hasattr(self, "activity_labels"):
+            self.schedule_activity_cells()
 
     def update_document_hint(self):
         total = len(self.documents_data)
@@ -664,6 +830,7 @@ class Dashboard:
     def add_document(self, row):
         self.documents_data.append(row)
         self.show_document(row)
+        self.sort_documents()
         self.fit_columns([row], grow=True)
         self.update_document_hint()
 
@@ -671,6 +838,7 @@ class Dashboard:
         self.documents.delete(*self.documents.get_children())
         for row in self.documents_data:
             self.show_document(row)
+        self.sort_documents()
         self.fit_columns()
         self.update_document_hint()
         self.update_link_buttons()
@@ -719,7 +887,7 @@ class Dashboard:
             parent=self.root,
             defaultextension=".xlsx",
             filetypes=[("Excel workbook", "*.xlsx")],
-            initialfile=f"Flawless_Submission_{self.run_month}.xlsx",
+            initialfile="Flawless_Submission_all_dates.xlsx",
         )
         if not path:
             return
@@ -761,16 +929,39 @@ class Dashboard:
         book, _, headers = read_source(path)
         book.close()
         sources = {
-            "manager": "Author Manager", "phase": "Phase",
-            "submitted": "Document Submitted", "url": "Document WS URL",
+            "manager": "Author Manager",
+            "reviewers": "Reviewer(s)",
+            "phase": "Phase",
+            "activity": activity_header(headers),
+            "submitted": "Document Submitted",
+            "url": "Document WS URL",
         }
         self.available_columns = {
-            column for column, _, _ in DOCUMENT_COLUMNS
+            column
+            for column in DOCUMENT_DISPLAY_COLUMNS
             if column not in sources or sources[column] in headers
         }
-        self.documents.configure(displaycolumns=[
-            column for column, _, _ in DOCUMENT_COLUMNS if column in self.available_columns
-        ])
+        sources["title"] = "Document" if "Document" in headers else "CCB Title"
+        by_header = {header: column for column, header in sources.items()}
+        display = ["result"]
+        if "submitted" in self.available_columns:
+            display.append("submitted")
+        for header in headers:
+            column = by_header.get(header)
+            if column is None or column in display:
+                continue
+            display.append(column)
+            if column == "manager":
+                display.append("organization")
+            if column == "phase" and sources["title"] not in headers:
+                display.append("title")
+        if "title" not in display:
+            display.append("title")
+        if "activity" in display and "phase" in display:
+            display.remove("phase")
+            display.insert(display.index("activity") + 1, "phase")
+        display.append("notes")
+        self.documents.configure(displaycolumns=display)
         self.render_documents()
 
     def save_reviewers(self):
@@ -828,7 +1019,6 @@ class Dashboard:
                 parent=self.root,
             )
             return
-        selected_month = None
         try:
             self.configure_workbook_columns(source)
         except (OSError, ValueError) as exc:
@@ -841,8 +1031,8 @@ class Dashboard:
             "reviewer_names": listed_names,
             "assigned_by_names": listed_names,
             "action_scope": "document",
+            "reuse_evidence": self.reuse_evidence.get(),
         }
-        self.run_month = "all_dates"
         self.running = True
         self.organization_warning = ""
         self.run_indicator.configure(text="Running", style="Running.TLabel")
@@ -862,7 +1052,7 @@ class Dashboard:
         self.progress.start()
         Thread(
             target=self.generate,
-            args=(source, evidence, config, selected_month, self.cancel),
+            args=(source, evidence, config, self.cancel),
             daemon=True,
         ).start()
 
@@ -872,7 +1062,7 @@ class Dashboard:
             self.stop_button.configure(state="disabled")
             self.status.set("Stopping - waiting for in-flight xCCB requests…")
 
-    def generate(self, source, evidence, config, selected_month, cancel):
+    def generate(self, source, evidence, config, cancel):
         # Workers never touch Tk widgets; all UI changes run on the main thread.
         try:
             with TemporaryDirectory(prefix="xccb_dashboard_") as directory:
@@ -882,12 +1072,14 @@ class Dashboard:
                     output,
                     config,
                     evidence,
-                    reader=WindowsReader(cancel=cancel),
+                    reader=WindowsReader(
+                        cancel=cancel,
+                        interval=config["request_interval_seconds"],
+                        transport=config["http_transport"],
+                    ),
                     on_progress=lambda counts, group, document: self.events.put(
                         ("progress", (counts, group, document))
                     ),
-                    reporting_month=selected_month,
-                    organization_codes=[],
                     refresh_organizations=self.organization_refresh,
                     on_organization_progress=lambda text: self.events.put(
                         ("organization_progress", text)

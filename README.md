@@ -27,7 +27,15 @@ Run from the folder containing `config.json`. Supply the source workbook and a n
 
 There are no subcommands or configuration/output-path flags. `--live` is the only operational option; `--help` shows usage.
 
+## Internal web application
+
+The hosted version uses Docker Compose for the browser app and a worker on a signed-in corporate Windows PC for live xCCB and DataSyncX access. See the [deployment runbook](WEB_DEPLOYMENT.md) for setup, redeployment and launch checks.
+
 ## Windows dashboard and executable
+
+The dashboard keeps Flawless and Submitted first. Source-backed fields, including Reviewer(s) and Activity Status, follow the uploaded workbook's ordering, except Phase is placed immediately after Activity. Organization stays after Author Manager and Notes is last. Phase retains its full cell text. Activity uses bold status-colored text with the same background as the rest of its Flawless row. Click header text to toggle ascending/descending sorting; use the filter arrow or right-click a heading to filter. Sorting changes only dashboard order, not the Excel export.
+
+Eligible submissions with valid workspace links are deduplicated by DocumentID, keeping the first eligible source row. Result and manager counts use retained rows. The Audit sheet keeps skipped duplicates with a reference to the retained source row; Summary records the number skipped. Missing or invalid links are not merged.
 
 Double-click `dist/xCCB_Report.exe`. It includes Python 3.13, Tkinter, openpyxl, Beautiful Soup, timezone data, DataSyncX 1.1.6, pandas and the Oracle Python driver. No separate Python or DataSyncX installation is required on the target machine. Live access still requires Windows, corporate network access and an authorized account; organization lookup also requires the approved native Oracle Client and TNS configuration described below.
 
@@ -102,7 +110,24 @@ The adapter reads the installed `datasyncx.utils.get_user_email` helper's connec
 
 The installed adapter calls `oracledb.init_oracle_client()` (thick mode). An approved, architecture-compatible native Oracle client, a working TNS resolution for `ALL.EMPLOYEE_HRDS`, corporate network/VPN and directory authorization are required separately. DataSyncX/pip installation alone does not supply these. Have IT provision them through approved procedures; this app does not install system clients or modify user-level Oracle/DataSyncX configuration. No Teams automation, Graph registration or another user's refresh is needed. If live access is unavailable, the user's own valid cache remains usable. A brand-new user without access/cache sees unresolved organizations and cannot reliably select them. Fresh-machine setup and complete KuAT hierarchy membership remain unverified.
 
-Captures contain sanitized HTML and JSON manifests, without forms, hidden inputs, scripts, cookies, or authentication headers. Keep them inside approved storage. Up to four document workers overlap I/O; duplicate document references share one fetch per run. Live request starts share a throttle of at least one second between requests, with a 25-second HTTP timeout, a 35-second process timeout, and at most two attempts for transient failures. 401/403 are not retried. A 200 response without the expected iframe/panel is not a successful check. Capture failures and parser warnings appear in the report's Audit sheet. Completion order does not change the saved workbook's manager ordering.
+Captures contain sanitized HTML and JSON manifests, without forms, hidden inputs, scripts, cookies, or authentication headers. Keep them inside approved storage. By default, four document workers overlap I/O; duplicate document references share one fetch per run. Each worker reuses its own authenticated HTTP session with the running Windows account and system certificate trust. Redirects are disabled. The session transport has 10-second connect and 25-second read timeouts; the optional PowerShell baseline retains its 25-second HTTP and 35-second process timeouts. Request starts share a one-second throttle by default, with at most two attempts for transient failures. 401/403 are not retried at application level. A 200 response without the expected iframe/panel is not a successful check. Capture failures and parser warnings appear in the report's Audit sheet. Completion order does not change the saved workbook's manager ordering.
+
+### Performance controls
+
+The settings in `config.example.json` work for both the dashboard and CLI. `http_transport` is `session` (default) or `powershell` (baseline); `document_workers` accepts 1-16; `request_interval_seconds` accepts 0.1-60. Keep the one-second default unless the site owner permits a higher request rate. Increasing worker count cannot bypass the shared throttle.
+
+`reuse_evidence` is off by default. The dashboard's **Reuse cache** checkbox enables it for a run; uncheck it to force live refresh. Only complete, validated whole-document evidence with a matching document identity and source hash is reused. Its age must be within both `live_cache_minutes` (15 by default) and `evidence_max_age_hours`. Invalid, incomplete, stale or future-dated evidence triggers a fresh capture. Reused evidence is identified in Audit; it is a snapshot and cannot reflect Actions changed after capture. A failed fresh capture never falls back to older evidence. Titles and Actions share one parse when evidence is loaded.
+
+CLI overrides allow like-for-like comparisons using a new output filename each time:
+
+```powershell
+python -m xccb_report source.xlsx baseline.xlsx --live --transport powershell --force-refresh
+python -m xccb_report source.xlsx session.xlsx --live --transport session --force-refresh
+python -m xccb_report source.xlsx cached.xlsx --live --reuse-evidence
+python -m xccb_report source.xlsx tuned.xlsx --live --workers 8 --interval 0.25 --force-refresh
+```
+
+The last command increases server load and requires permission to use that request rate. Summary records processing time before export, organization lookup time, unique documents, cache hits, HTTP attempts, transport and worker/spacing settings. HTTP and throttle times are sums across workers, not wall-clock durations; authentication handshakes are not counted as separate application request attempts. CLI logging also reports elapsed time including export.
 
 Each output must have a new filename. Source and existing output workbooks are never overwritten. The report preserves source values, styles and hyperlinks, inserts `Organization` after `Author Manager`, puts the verified `Document` title after Phase, and appends `Flawless submission`. Column positions adapt to available optional source fields. Header row 3 becomes row 1. Summary and Audit record selection exceptions, evidence, matched identities and unresolved counts. Audit retains every input row outcome. The main sheet includes qualifying rows even when Actions classification is unresolved; missing settings or evidence produce a DRAFT without suppressing those rows.
 
@@ -110,18 +135,18 @@ CLI reports default to the current month in `Asia/Kuala_Lumpur`, using an inclus
 
 ## Completeness and classification
 
-Capturing HTML does **not** mark evidence complete. Before a manifest is used, an authorized verifier must check the actual source and fill `scope: "document"`, `validated_by`, and `validation_notes`. Notes must identify the validation of full active/closed/historical listings, pagination, and scope. Set `complete: true` only when the whole relevant history was inspected. The application reparses the captured HTML, verifies its document ID/hash/time, and rejects stale, future, malformed, or mismatched evidence. The default maximum evidence age is 24 hours.
+The current live reader records document scope and marks an Actions panel complete when capture finds the expected document iframe and parsing reports no errors. Before relying on live `Yes` results, compare this behavior against the xCCB portal and confirm that the panel contains the full active, closed and historical listings, including any pagination. Manually saved evidence needs an authorized verifier to record `scope: "document"`, `validated_by`, `validation_notes`, and whether that full listing was inspected in `complete`. The application reparses the captured HTML, verifies its document ID/hash/time, and rejects stale, future, malformed, or mismatched evidence. The default maximum evidence age is 24 hours.
 
 - One matching `Assigned By` identity gives `No` once the evidence scope is confirmed, even if the remaining listing is incomplete.
-- No match gives `Yes` only when the full listing is attested complete and parsing has no warnings.
+- No match gives `Yes` only when the evidence records the listing as complete and parsing has no warnings.
 - Otherwise the Yes/No cell stays blank and Audit explains why.
 - An empty listing additionally requires an explicitly observed empty-state message: set `empty_state_verified: true` and `empty_state_text` to that exact visible message. An absent/blank table is not sufficient.
 
-Attestations are trusted local inputs, not cryptographic proof. Do not edit a manifest to force a result. A new live capture resets all attestations, so current `--live` reporting remains conservative until that capture has been validated. Automated live `Yes` classification is deliberately not enabled by an unproven global completeness assumption. A verified site-wide extraction contract could remove the per-capture review later; it has not been established in this investigation.
+Each fresh live capture replaces the previous manifest. Attestations are trusted local inputs. Edit a saved manifest only to record verified observations.
 
 After verifying the manifests in `outputs/evidence`, rerun without `--live` and choose a new output filename to generate the report from that validated evidence.
 
-Evidence is cached by Document ID only for explicitly whole-document scope, within the report run. Failed live capture never falls back to an older successful result. Phase/version/source date remain visible in Audit. Do not reuse this cache for submission-specific results.
+Evidence is grouped by Document ID only for explicitly whole-document scope. Duplicate references share one resolution within a run; optional fresh-cache reuse can avoid refetching across runs under the rules above. Failed live capture never falls back to an older successful result. Phase/version/source date remain visible in Audit. Do not reuse this cache for submission-specific results.
 
 ## Process flow
 
@@ -140,6 +165,7 @@ flowchart LR
 ## Validation and findings
 
 ```powershell
+.\.venv\Scripts\python -m pip install -r requirements-web.txt
 .\.venv\Scripts\python -m pytest -q
 ```
 
